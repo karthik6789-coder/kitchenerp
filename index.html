@@ -211,12 +211,17 @@
   <div style="display:flex; gap:10px; flex-wrap:wrap; margin-top:10px;">
     <button class="btn btn-info" onclick="previewEntry()" style="flex:1;">👁️ Preview Before Submit</button>
     <button class="btn btn-success" onclick="submitEntry()" style="flex:2; padding:14px; font-size:18px;">🚀 SUBMIT DAY SHEET</button>
-    <button class="btn btn-primary" onclick="generatePDF()" style="flex:1;">📄 Save PDF</button>
+    <button class="btn btn-primary" onclick="generatePDF()" style="flex:1;">📄 Download PDF</button>
   </div>
   <div id="result"></div>
 </div>
 
 <script>
+  // ============================================================
+  // 🔥 IMPORTANT: మీరు డిప్లాయ్ చేసిన Apps Script Web App URL ఇక్కడ పెట్టండి
+  // ============================================================
+  const scriptURL = 'https://script.google.com/macros/s/AKfycbx9ziOw2iDFE12VqiavSGSB6RHwYfyfk6PtE9SqMYYdiAQ_bLakQfForVIh0QfiSOplvw/exec'; // ఉదా: https://script.google.com/macros/s/.../exec
+
   // ==================== GLOBALS ====================
   var allKitchens = [], allProvisions = [], allBakeries = [];
   var currentBranches = [];
@@ -231,17 +236,25 @@
 
   // ==================== INIT ====================
   window.onload = function() {
-    google.script.run.withSuccessHandler(function(k) {
-      allKitchens = k;
-      var dl = document.getElementById('kitchenList');
-      k.forEach(function(kit) { var opt = document.createElement('option'); opt.value = kit.id + ' | ' + kit.name; dl.add(opt); });
-    }).getKitchens();
+    // Fetch Kitchens
+    fetch(scriptURL + '?action=getKitchens')
+      .then(response => response.json())
+      .then(k => {
+        allKitchens = k;
+        var dl = document.getElementById('kitchenList');
+        k.forEach(function(kit) { var opt = document.createElement('option'); opt.value = kit.id + ' | ' + kit.name; dl.add(opt); });
+      })
+      .catch(err => console.error('Error loading kitchens:', err));
 
-    google.script.run.withSuccessHandler(function(p) {
-      allProvisions = p;
-      console.log('Provisions loaded: ' + p.length);
-      addReceiptRow();
-    }).getProvisions();
+    // Fetch Provisions
+    fetch(scriptURL + '?action=getProvisions')
+      .then(response => response.json())
+      .then(p => {
+        allProvisions = p;
+        console.log('Provisions loaded: ' + p.length);
+        addReceiptRow();
+      })
+      .catch(err => console.error('Error loading provisions:', err));
 
     document.getElementById('entryDate').value = new Date().toISOString().split('T')[0];
   };
@@ -334,7 +347,7 @@
     return function cleanup() { if (itemsDiv.parentNode) itemsDiv.parentNode.removeChild(itemsDiv); };
   }
 
-  // ==================== KITCHEN SEARCH (with debugging) ====================
+  // ==================== KITCHEN SEARCH ====================
   function loadKitchenDetails() {
     var input = document.getElementById('kitchenInput');
     var val = input.value.trim();
@@ -349,7 +362,6 @@
     if (matched) {
       selectedKitchenId = matched.id;
       
-      // Collect ALL bakeries for this Kitchen ID
       var allBakeriesForKitchen = [];
       allKitchens.forEach(function(k) {
         if (k.id === matched.id && k.bakery && k.bakery.trim() !== '') {
@@ -365,13 +377,12 @@
 
       detailsDiv.innerHTML = '<strong>' + matched.name + '</strong> | Location: ' + matched.location + ' | Bulk Store: ' + (matched.bulkStore || 'N/A') + ' | Bakery: ' + bakeryDisplay;
       
-      // Fetch Branches from backend (with foodSupplied)
-      google.script.run
-        .withSuccessHandler(function(branches) {
-          console.log('Raw branches from backend:', branches);
-          alert('Branches loaded: ' + branches.length + ' branches found.');
+      // Fetch Branches using Fetch API
+      fetch(scriptURL + '?action=getBranches&kitchenId=' + encodeURIComponent(matched.id))
+        .then(response => response.json())
+        .then(branches => {
+          console.log('Branches loaded:', branches);
           allBranchesFromBackend = branches;
-          // Split into Mandatory and Optional based on foodSupplied field
           mandatoryBranches = branches.filter(function(b) { 
             return b.foodSupplied === 'Mandatory' || !b.foodSupplied || b.foodSupplied === ''; 
           });
@@ -381,28 +392,21 @@
           console.log('Mandatory:', mandatoryBranches);
           console.log('Optional:', optionalBranches);
           addedOptionalIds = [];
-          // Start with only mandatory branches
           currentBranches = mandatoryBranches.map(function(b) { return { ...b, isOptional: false }; });
           renderBranchTable(currentBranches);
           
-          // Attach autocomplete to optional branch input with the optional branch names
           var optInput = document.getElementById('optionalBranchInput');
-          attachAutocomplete(optInput, optionalBranches.map(function(b) { return b.name; }), function(selected) {
-            // Just fill the input; user will click Add
-          });
+          attachAutocomplete(optInput, optionalBranches.map(function(b) { return b.name; }), function(selected) {});
           
-          // If mapping/wastage already generated, refresh them
           if (document.getElementById('mappingSection').style.display !== 'none') {
             generateMappingTables();
             generateWastageTable();
           }
         })
-        .withFailureHandler(function(err) {
-          console.error('Error fetching branches:', err);
-          alert('Error fetching branches: ' + err);
+        .catch(error => {
+          console.error('Error fetching branches:', error);
           container.innerHTML = '<p style="color:red;">Error loading branches. Please check console.</p>';
-        })
-        .getBranches(matched.id);
+        });
     } else {
       selectedKitchenId = '';
       detailsDiv.innerHTML = '<span style="color:red;">Kitchen not found.</span>';
@@ -424,21 +428,17 @@
       alert('Branch already added.');
       return;
     }
-    // Save current values before re-render
     var existingValues = getBranchInputValues();
-    // Add to current branches
     currentBranches.push({ ...branchToAdd, isOptional: true });
     addedOptionalIds.push(branchToAdd.id);
     renderBranchTable(currentBranches, existingValues);
     input.value = '';
-    // Update mapping/wastage if visible
     if (document.getElementById('mappingSection').style.display !== 'none') {
       generateMappingTables();
       generateWastageTable();
     }
   }
 
-  // ==================== REMOVE OPTIONAL BRANCH ====================
   function removeOptionalBranch(branchId) {
     if (!confirm('Remove this optional branch from the list?')) return;
     var index = -1;
@@ -463,7 +463,6 @@
     }
   }
 
-  // ==================== GET CURRENT INPUT VALUES ====================
   function getBranchInputValues() {
     var values = {};
     var rows = document.querySelectorAll('#branchContainer .branch-row');
@@ -484,7 +483,6 @@
     return values;
   }
 
-  // ==================== RENDER BRANCH TABLE ====================
   function renderBranchTable(branches, existingValues) {
     var container = document.getElementById('branchContainer');
     if (!branches || branches.length === 0) {
@@ -1142,7 +1140,7 @@
     showResult(previewHtml, 'info');
   }
 
-  // ==================== SUBMIT ====================
+  // ==================== SUBMIT (Using Fetch) ====================
   function submitEntry() {
     var kitchenInput = document.getElementById('kitchenInput').value;
     var kitchenId = kitchenInput.indexOf(' | ') > -1 ? kitchenInput.split(' | ')[0] : kitchenInput;
@@ -1200,25 +1198,36 @@
     }
 
     showResult('⏳ Submitting...', 'info');
-    google.script.run
-      .withSuccessHandler(function(res) {
-        if (res.success) {
-          var s = res.summary;
-          showResult('✅ ' + res.message + '\nDiners: ' + s.totalDiners + '\nActual: ₹' + s.actualPerHeadCost.toFixed(2) + '\nTarget: ₹' + s.targetPerHead.toFixed(2) + '\nVariance: ₹' + s.variance.toFixed(2) + ' (' + s.status + ')\nWastage/Head: ' + s.perHeadWastage.toFixed(2) + 'g', 'success');
-        } else {
-          showResult('❌ ' + res.message + '\n' + res.errors.join('\n'), 'error');
-        }
-      })
-      .withFailureHandler(function(err) { showResult('❌ Error: ' + err, 'error'); })
-      .submitDaySheet(payload);
+
+    // 🔥 Fetch API ద్వారా POST request పంపండి
+    fetch(scriptURL, {
+      method: 'POST',
+      mode: 'cors',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(payload)
+    })
+    .then(response => response.json())
+    .then(res => {
+      if (res.success) {
+        var s = res.summary;
+        showResult('✅ ' + res.message + '\nDiners: ' + s.totalDiners + '\nActual: ₹' + s.actualPerHeadCost.toFixed(2) + '\nTarget: ₹' + s.targetPerHead.toFixed(2) + '\nVariance: ₹' + s.variance.toFixed(2) + ' (' + s.status + ')\nWastage/Head: ' + s.perHeadWastage.toFixed(2) + 'g', 'success');
+      } else {
+        showResult('❌ ' + res.message + '\n' + (res.errors || []).join('\n'), 'error');
+      }
+    })
+    .catch(error => {
+      console.error('Submit Error:', error);
+      showResult('❌ Network Error: ' + error.message, 'error');
+    });
   }
 
+  // ==================== PDF Download (Using Fetch/Window) ====================
   function generatePDF() {
-    showResult('⏳ Generating PDF...', 'info');
-    google.script.run
-      .withSuccessHandler(function() { showResult('✅ PDF saved to Drive.', 'success'); })
-      .withFailureHandler(function(err) { showResult('❌ PDF Error: ' + err, 'error'); })
-      .generatePDFReport();
+    // Apps Script నుండి PDF డౌన్‌లోడ్ చేయడానికి new window open చేయండి
+    window.open(scriptURL + '?action=pdf', '_blank');
+    showResult('📄 PDF Download started. Please check your downloads folder.', 'info');
   }
 
   function showResult(msg, type) {
