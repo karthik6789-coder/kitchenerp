@@ -69,6 +69,11 @@
   .badge{display:inline-block;padding:2px 8px;border-radius:6px;font-size:11px;font-weight:700;}
   .badge.ok{background:#f0fdf4;color:#166534;}
   .badge.over{background:#fef2f2;color:#b91c1c;}
+  .pickerWrap{position:relative;display:inline-block;}
+  .pickerList{position:absolute;top:100%;left:0;right:0;max-height:260px;overflow-y:auto;background:#fff;border:1px solid var(--border-strong);border-radius:8px;box-shadow:0 6px 18px rgba(0,0,0,.12);z-index:40;display:none;margin-top:2px;}
+  .pickerRow{padding:6px 10px;font-size:12.5px;cursor:pointer;border-bottom:1px solid var(--border);}
+  .pickerRow:hover{background:var(--accent-soft);}
+  .pickerRow .pid{color:var(--ink-faint);font-family:monospace;font-size:11px;}
   #loginScreen{max-width:380px;margin:80px auto;text-align:center;}
   #loginScreen .card{text-align:left;}
   .errmsg{color:var(--red);font-size:12.5px;margin-top:6px;min-height:16px;}
@@ -105,6 +110,7 @@
   </div>
 
   <div id="view-entry" class="view"></div>
+  <div id="view-reports" class="view"></div>
   <div id="view-dashboard" class="view"></div>
   <div id="view-master" class="view"></div>
 </div>
@@ -258,11 +264,95 @@ function toast(msg){
 }
 function round(n, d=2){ const f=Math.pow(10,d); return Math.round((+n||0)*f)/f; }
 function fmt(n, d=2){ return round(n,d).toLocaleString('en-IN',{minimumFractionDigits:d,maximumFractionDigits:d}); }
+// A day with no activity for some metric shows as 0 — averaging that 0 in with real days
+// drags the average down and misrepresents it (e.g. 35,0,45,55 should average to 45, the
+// three days that actually had activity, not 33.75 across all four including the empty one).
+function avgExcludingZero(values){
+  const nonZero = values.filter(v => v !== 0 && v != null && !isNaN(v));
+  if (!nonZero.length) return 0;
+  return nonZero.reduce((a,b)=>a+b,0) / nonZero.length;
+}
 function fmtMoney(n){ return '₹'+Math.round(+n||0).toLocaleString('en-IN'); }
 function isoDate(d){ return d.toISOString().slice(0,10); }
 function addDays(iso, n){ const d=new Date(iso+'T00:00:00'); d.setDate(d.getDate()+n); return isoDate(d); }
 function ddmmyyyy(iso){ const [y,m,d]=iso.split('-'); return `${d}-${m}-${y}`; }
 function escapeAttr(s){ return String(s==null?'':s).replace(/"/g,'&quot;'); }
+
+// Every field auto-saves by re-rendering the whole entry screen (so totals/costs/available-
+// balance everywhere stay correct) — but a naive re-render destroys and rebuilds every input,
+// which throws away keyboard focus mid-Tab and mid-Enter. Reading document.activeElement
+// AFTER an await turned out to be unreliable — by the time an async change-handler resumes,
+// blur has already fired and focus can sit on <body> for a moment, so timing races made the
+// old approach miss the field entirely. Instead, a lightweight 'focusin' listener keeps a
+// running record of whichever field most recently had focus — reliable regardless of when
+// the re-render actually happens.
+let _lastFocusedKey = null, _lastFocusedSelStart = null, _lastFocusedSelEnd = null;
+document.addEventListener('focusin', (e)=>{
+  const key = e.target && e.target.dataset && e.target.dataset.focusKey;
+  if (key){
+    _lastFocusedKey = key;
+    _lastFocusedSelStart = typeof e.target.selectionStart === 'number' ? e.target.selectionStart : null;
+    _lastFocusedSelEnd = typeof e.target.selectionEnd === 'number' ? e.target.selectionEnd : null;
+  }
+  // Select the existing value whenever a number field gains focus — otherwise Tab lands the
+  // cursor at position 0 of a default "0", so typing inserts beside it ("5" into "0" becomes
+  // "50" instead of replacing it). Selecting first makes typing simply overwrite, like a
+  // spreadsheet cell — this is what was producing corrupted values like 200/50/20/10 instead
+  // of 20/5/2/1 when tabbing straight through a row.
+  if (e.target && e.target.tagName === 'INPUT' && e.target.type === 'number'){
+    e.target.select();
+  }
+});
+async function renderEntryPreservingFocus(){
+  // A short delay here matters: pressing Tab blurs the current field (firing this handler)
+  // and moves focus to the next field as two parts of the SAME browser action — if the
+  // re-render runs immediately, it can finish before the browser gets to the "move focus
+  // to the next field" part, so we'd end up re-focusing the field the user just left
+  // instead of the one Tab was headed to. Waiting one tick lets that native focus-move
+  // complete first, so the 'focusin' tracker above has already caught up to it.
+  await new Promise(r => setTimeout(r, 30));
+  const focusKey = _lastFocusedKey;
+  await renderEntry();
+  if (focusKey){
+    const el = document.querySelector(`[data-focus-key="${CSS.escape(focusKey)}"]`);
+    if (el) el.focus(); // triggers the 'focusin' listener above, which also selects its content
+  }
+}
+function fk(...parts){ return parts.join('::'); }
+
+// Reusable searchable provision picker — replaces a plain <select> (unusable once you have
+// 500+ provisions) with type-to-filter, shown as "ID | Name | UOM | Category" per your format.
+// Returns {getSelectedId, reset}. inputEl and listEl must already be in the DOM.
+function attachProvisionPicker(inputEl, listEl, optionsProvider){
+  let selectedId = null;
+  const fmt = pm => `${pm.provisionId||'—'} | ${pm.name} | ${pm.uom} | ${pm.category}`;
+  function renderList(filter){
+    const opts = optionsProvider();
+    const f = (filter||'').trim().toUpperCase();
+    const matches = !f ? opts.slice(0,30) : opts.filter(pm => fmt(pm).toUpperCase().includes(f)).slice(0,30);
+    listEl.innerHTML = matches.length ? matches.map(pm=>
+      `<div class="pickerRow" data-id="${pm.id}"><span class="pid">${escapeAttr(pm.provisionId||'')}</span> — ${escapeAttr(pm.name)} <span class="pid">(${escapeAttr(pm.uom)}, ${escapeAttr(pm.category)})</span></div>`
+    ).join('') : '<div class="note" style="padding:8px;">No matches</div>';
+    listEl.style.display = 'block';
+    listEl.querySelectorAll('[data-id]').forEach(row=>{
+      row.addEventListener('mousedown', (e)=>{
+        e.preventDefault();
+        selectedId = row.dataset.id;
+        const pm = optionsProvider().find(o=>o.id===selectedId);
+        inputEl.value = fmt(pm);
+        listEl.style.display = 'none';
+      });
+    });
+  }
+  inputEl.addEventListener('input', ()=>{ selectedId = null; renderList(inputEl.value); });
+  inputEl.addEventListener('focus', ()=> renderList(inputEl.value));
+  inputEl.addEventListener('blur', ()=> setTimeout(()=>{ listEl.style.display='none'; }, 150));
+  return {
+    getSelectedId: ()=> selectedId,
+    reset: ()=>{ selectedId=null; inputEl.value=''; },
+  };
+}
+
 
 async function initFirebase(){
   if (USE_LOCAL_MOCK){
@@ -328,6 +418,7 @@ const AC_TYPES = ['AC','SEMI-AC','NON-AC'];
 let kitchens = [], branches = [], provisions = [], menuItems = [], recipes = {};
 let currentKitchenId = null;
 let currentDate = isoDate(new Date());
+let reportFromDate = null, reportToDate = null; // persisted separately so re-rendering the dashboard never resets a date range you already picked
 let dayCache = {};
 
 function myKitchenIds(){
@@ -370,158 +461,172 @@ async function importMasterDataFromExcel(){
   };
 
   let counts = {kitchens:0, provisions:0, branches:0, openingBalances:0, targets:0};
+  const sectionErrors = []; // one section failing (e.g. a permissions issue) must not stop the rest
   const kitchenCodeToId = {}; kitchens.forEach(k=>{ if (k.kitchenCode) kitchenCodeToId[k.kitchenCode]=k.id; });
   const provisionCodeToId = {}; provisions.forEach(p=>{ if (p.provisionId) provisionCodeToId[p.provisionId]=p.id; });
+  let multiBakeryKitchens = [];
 
   // 1) Kitchens — must go first, everything else references KITCHEN_ID. A KITCHEN_ID can
   // legitimately repeat if the kitchen is served by more than one bakery (confirmed in your
   // file: KVJA106208 has both "VJA BAKERY 1" and "VJA BAKERY 3" on separate rows) — so bakery
   // names are ACCUMULATED into a list per kitchen, never overwritten.
-  const kRows = sheetRows('Kitchen_List');
-  let multiBakeryKitchens = [];
-  if (kRows){
-    status.textContent = `Importing ${kRows.length} kitchens…`;
-    for (const row of kRows){
-      const code = cleanImportedText(row['KITCHEN_ID']);
-      if (!code) continue;
-      const bakery = cleanImportedText(row['BAKERY_NAME']);
-      let id = kitchenCodeToId[code];
-      if (!id){
-        id = newId();
-        const data = {
-          stateCode: cleanImportedText(row['STATE']),
-          division: cleanImportedText(row['DIVISION']),
-          kitchenCode: code,
-          name: cleanImportedText(row['KITCHEN_NAME']),
-          bulkStoreName: cleanImportedText(row['BULK_STORE_NAME']),
-          bakeryNames: bakery ? [bakery] : [],
-        };
-        kitchens.push(Object.assign({id}, data));
-        kitchenCodeToId[code] = id;
-        await dbSet('kitchens', id, data);
-      } else {
-        const existing = kitchens.find(k=>k.id===id);
-        if (bakery && !existing.bakeryNames.includes(bakery)){
-          existing.bakeryNames.push(bakery);
-          multiBakeryKitchens.push(existing.name);
-          await dbSet('kitchens', id, existing);
+  try{
+    const kRows = sheetRows('Kitchen_List');
+    if (kRows){
+      status.textContent = `Importing ${kRows.length} kitchens…`;
+      for (const row of kRows){
+        const code = cleanImportedText(row['KITCHEN_ID']);
+        if (!code) continue;
+        const bakery = cleanImportedText(row['BAKERY_NAME']);
+        let id = kitchenCodeToId[code];
+        if (!id){
+          id = newId();
+          const data = {
+            stateCode: cleanImportedText(row['STATE']),
+            division: cleanImportedText(row['DIVISION']),
+            kitchenCode: code,
+            name: cleanImportedText(row['KITCHEN_NAME']),
+            bulkStoreName: cleanImportedText(row['BULK_STORE_NAME']),
+            bakeryNames: bakery ? [bakery] : [],
+          };
+          kitchens.push(Object.assign({id}, data));
+          kitchenCodeToId[code] = id;
+          await dbSet('kitchens', id, data);
+        } else {
+          const existing = kitchens.find(k=>k.id===id);
+          if (bakery && !existing.bakeryNames.includes(bakery)){
+            existing.bakeryNames.push(bakery);
+            multiBakeryKitchens.push(existing.name);
+            await dbSet('kitchens', id, existing);
+          }
         }
+        counts.kitchens++;
       }
-      counts.kitchens++;
     }
-  }
+  } catch(e){ sectionErrors.push('Kitchens: ' + (e.message||e)); }
 
   // 2) Provisions
-  const pRows = sheetRows('Provision_List');
-  if (pRows){
-    status.textContent = `Importing ${pRows.length} provisions…`;
-    for (const row of pRows){
-      const code = cleanImportedText(row['PROVISION ID']);
-      if (!code) continue;
-      let id = provisionCodeToId[code];
-      const existing = id ? provisions.find(p=>p.id===id) : null;
-      const data = {
-        provisionType: cleanImportedText(row['PROVISION TYPE']),
-        provisionId: code,
-        name: cleanImportedText(row['PROVISION NAME']),
-        uom: cleanImportedText(row['UOM']),
-        category: cleanImportedText(row['CATEGORY']),
-        rate: existing ? existing.rate : 0, // rate isn't in this sheet — preserve whatever's already set
-      };
-      if (!id){ id = newId(); provisions.push(Object.assign({id}, data)); provisionCodeToId[code] = id; }
-      else { Object.assign(existing, data); }
-      await dbSet('provisions', id, data);
-      counts.provisions++;
+  try{
+    const pRows = sheetRows('Provision_List');
+    if (pRows){
+      status.textContent = `Importing ${pRows.length} provisions…`;
+      for (const row of pRows){
+        const code = cleanImportedText(row['PROVISION ID']);
+        if (!code) continue;
+        let id = provisionCodeToId[code];
+        const existing = id ? provisions.find(p=>p.id===id) : null;
+        const data = {
+          provisionType: cleanImportedText(row['PROVISION TYPE']),
+          provisionId: code,
+          name: cleanImportedText(row['PROVISION NAME']),
+          uom: cleanImportedText(row['UOM']),
+          category: cleanImportedText(row['CATEGORY']),
+          rate: existing ? existing.rate : 0, // rate isn't in this sheet — preserve whatever's already set
+        };
+        if (!id){ id = newId(); provisions.push(Object.assign({id}, data)); provisionCodeToId[code] = id; }
+        else { Object.assign(existing, data); }
+        await dbSet('provisions', id, data);
+        counts.provisions++;
+      }
     }
-  }
+  } catch(e){ sectionErrors.push('Provisions: ' + (e.message||e)); }
 
   // 3) Branches — needs the kitchen map from step 1
-  const bRows = sheetRows('Kitchen_wise_Branch_List');
-  if (bRows){
-    status.textContent = `Importing ${bRows.length} branches…`;
-    for (const row of bRows){
-      const kCode = cleanImportedText(row['KITCHEN_ID']);
-      const campusId = cleanImportedText(row['CAMPUS_ID']);
-      const kitchenId = kitchenCodeToId[kCode];
-      if (!kitchenId || !campusId) continue; // can't place a branch without a known kitchen
-      let existing = branches.find(b => b.kitchenId===kitchenId && b.campusId===campusId);
-      const data = {
-        kitchenId, campusId,
-        name: cleanImportedText(row['CAMPUS_NAME']),
-        acType: cleanImportedText(row['STU_TYPE']) || 'AC',
-        intType: cleanImportedText(row['INT_TYPE']) || 'SCHOOL',
-        foodSupplied: cleanImportedText(row['FOOD_SUPPLIED']) || 'Mandatory',
-        active: true,
-      };
-      if (!existing){ const id = newId(); existing = Object.assign({id}, data); branches.push(existing); await dbSet('branches', id, data); }
-      else { Object.assign(existing, data); await dbSet('branches', existing.id, data); }
-      counts.branches++;
+  try{
+    const bRows = sheetRows('Kitchen_wise_Branch_List');
+    if (bRows){
+      status.textContent = `Importing ${bRows.length} branches…`;
+      for (const row of bRows){
+        const kCode = cleanImportedText(row['KITCHEN_ID']);
+        const campusId = cleanImportedText(row['CAMPUS_ID']);
+        const kitchenId = kitchenCodeToId[kCode];
+        if (!kitchenId || !campusId) continue; // can't place a branch without a known kitchen
+        let existing = branches.find(b => b.kitchenId===kitchenId && b.campusId===campusId);
+        const data = {
+          kitchenId, campusId,
+          name: cleanImportedText(row['CAMPUS_NAME']),
+          acType: cleanImportedText(row['STU_TYPE']) || 'AC',
+          intType: cleanImportedText(row['INT_TYPE']) || 'SCHOOL',
+          foodSupplied: cleanImportedText(row['FOOD_SUPPLIED']) || 'Mandatory',
+          active: true,
+        };
+        if (!existing){ const id = newId(); existing = Object.assign({id}, data); branches.push(existing); await dbSet('branches', id, data); }
+        else { Object.assign(existing, data); await dbSet('branches', existing.id, data); }
+        counts.branches++;
+      }
     }
-  }
+  } catch(e){ sectionErrors.push('Branches: ' + (e.message||e)); }
 
   // 4) Opening balances — seeds a starting day so the cascade has somewhere to carry
   // forward from. Written straight into dailyEntries for the given date, per kitchen.
-  const obRows = sheetRows('Opening_Closing_Balance');
-  if (obRows){
-    status.textContent = `Importing ${obRows.length} opening balances…`;
-    const byKitchenDate = {}; // "kitchenId|date" -> {provisionId: opening}
-    for (const row of obRows){
-      const kCode = cleanImportedText(row['KITCHEN_ID']);
-      const pCode = cleanImportedText(row['PROVISION ID']);
-      const kitchenId = kitchenCodeToId[kCode];
-      const provisionId = provisionCodeToId[pCode];
-      if (!kitchenId || !provisionId) continue;
-      let dateVal = row['OPENING BALANCE DATE'];
-      let dateStr = (dateVal instanceof Date) ? isoDate(dateVal) : currentDate;
-      const key = kitchenId + '|' + dateStr;
-      if (!byKitchenDate[key]) byKitchenDate[key] = {};
-      byKitchenDate[key][provisionId] = +row['OPENING BALANCE'] || 0;
-      counts.openingBalances++;
+  try{
+    const obRows = sheetRows('Opening_Closing_Balance');
+    if (obRows){
+      status.textContent = `Importing ${obRows.length} opening balances…`;
+      const byKitchenDate = {}; // "kitchenId|date" -> {provisionId: opening}
+      for (const row of obRows){
+        const kCode = cleanImportedText(row['KITCHEN_ID']);
+        const pCode = cleanImportedText(row['PROVISION ID']);
+        const kitchenId = kitchenCodeToId[kCode];
+        const provisionId = provisionCodeToId[pCode];
+        if (!kitchenId || !provisionId) continue;
+        let dateVal = row['OPENING BALANCE DATE'];
+        let dateStr = (dateVal instanceof Date) ? isoDate(dateVal) : currentDate;
+        const key = kitchenId + '|' + dateStr;
+        if (!byKitchenDate[key]) byKitchenDate[key] = {};
+        byKitchenDate[key][provisionId] = +row['OPENING BALANCE'] || 0;
+        counts.openingBalances++;
+      }
+      for (const key of Object.keys(byKitchenDate)){
+        const [kitchenId, dateStr] = key.split('|');
+        const day = await getDay(kitchenId, dateStr);
+        Object.entries(byKitchenDate[key]).forEach(([provisionId, opening])=>{
+          if (!day.provisions[provisionId]){
+            const pm = provisions.find(p=>p.id===provisionId);
+            day.provisions[provisionId] = { opening, recvVendor:0,recvBulk:0,recvOther:0,recvBakery:0, issued:0, rate: pm?pm.rate:0, dish:{}, _openingIsCarried:false, _rateIsCarried:false };
+          } else {
+            day.provisions[provisionId].opening = opening;
+          }
+        });
+        await saveDay(kitchenId, dateStr);
+      }
     }
-    for (const key of Object.keys(byKitchenDate)){
-      const [kitchenId, dateStr] = key.split('|');
-      const day = await getDay(kitchenId, dateStr);
-      Object.entries(byKitchenDate[key]).forEach(([provisionId, opening])=>{
-        if (!day.provisions[provisionId]){
-          const pm = provisions.find(p=>p.id===provisionId);
-          day.provisions[provisionId] = { opening, recvVendor:0,recvBulk:0,recvOther:0,recvBakery:0, issued:0, rate: pm?pm.rate:0, dish:{}, _openingIsCarried:false, _rateIsCarried:false };
-        } else {
-          day.provisions[provisionId].opening = opening;
-        }
-      });
-      await saveDay(kitchenId, dateStr);
-    }
-  }
+  } catch(e){ sectionErrors.push('Opening balances: ' + (e.message||e)); }
 
   // 5) Session & category targets
-  const tRows = sheetRows('Targets');
-  if (tRows){
-    status.textContent = `Importing ${tRows.length} target rows…`;
-    for (const row of tRows){
-      const kCode = cleanImportedText(row['KITCHEN_ID']);
-      const kitchenId = kitchenCodeToId[kCode];
-      if (!kitchenId) continue;
-      const data = {
-        breakfast: +row['BREAKFAST TARGET PER HEAD'] || 0,
-        lunch: +row['LUNCH TARGET PER HEAD'] || 0,
-        snacks: +row['SNACKS TARGET PER HEAD'] || 0,
-        dinner: +row['DINNER TARGET PER HEAD'] || 0,
-        rice: +row['RICE TARGET PER HEAD'] || 0,
-        milkCurd: +row['MILK & CURD TARGET PER HEAD'] || 0,
-        gasDiesel: +row['GAS & DIESEL TARGET PER HEAD'] || 0,
-        firewood: +row['FIRE WOOD & PILLETS TARGET PER HEAD'] || 0,
-      };
-      await dbSet('sessionTargets', kitchenId, data);
-      counts.targets++;
+  try{
+    const tRows = sheetRows('Targets');
+    if (tRows){
+      status.textContent = `Importing ${tRows.length} target rows…`;
+      for (const row of tRows){
+        const kCode = cleanImportedText(row['KITCHEN_ID']);
+        const kitchenId = kitchenCodeToId[kCode];
+        if (!kitchenId) continue;
+        const data = {
+          breakfast: +row['BREAKFAST TARGET PER HEAD'] || 0,
+          lunch: +row['LUNCH TARGET PER HEAD'] || 0,
+          snacks: +row['SNACKS TARGET PER HEAD'] || 0,
+          dinner: +row['DINNER TARGET PER HEAD'] || 0,
+          rice: +row['RICE TARGET PER HEAD'] || 0,
+          milkCurd: +row['MILK & CURD TARGET PER HEAD'] || 0,
+          gasDiesel: +row['GAS & DIESEL TARGET PER HEAD'] || 0,
+          firewood: +row['FIRE WOOD & PILLETS TARGET PER HEAD'] || 0,
+        };
+        await dbSet('sessionTargets', kitchenId, data);
+        counts.targets++;
+      }
     }
-  }
+  } catch(e){ sectionErrors.push('Targets: ' + (e.message||e)); }
 
   const uniqueKitchenNote = multiBakeryKitchens.length
     ? `<br>ℹ️ ${multiBakeryKitchens.length} kitchen row(s) shared a Kitchen ID with an earlier row and were correctly recognized as extra bakeries for the SAME kitchen, not duplicates: ${multiBakeryKitchens.join(', ')}.`
     : '';
-  status.innerHTML = `✓ Done — ${counts.kitchens} kitchen rows processed (${kitchens.length} unique kitchens), ${counts.provisions} provisions, ${counts.branches} branches, ${counts.openingBalances} opening balances, ${counts.targets} target rows.${uniqueKitchenNote}`;
-  toast('Master data imported');
-  setTimeout(renderMaster, 2500); // let the confirmation message stay visible briefly before the full refresh replaces it
+  const errorNote = sectionErrors.length
+    ? `<br><b style="color:#b91c1c;">⚠ ${sectionErrors.length} section(s) failed — usually means your Firestore Security Rules on the live project are out of date; re-publish the latest firestore.rules and try again:</b><br>${sectionErrors.map(e=>'• '+escapeAttr(e)).join('<br>')}`
+    : '';
+  status.innerHTML = `✓ Done — ${counts.kitchens} kitchen rows processed (${kitchens.length} unique kitchens), ${counts.provisions} provisions, ${counts.branches} branches, ${counts.openingBalances} opening balances, ${counts.targets} target rows.${uniqueKitchenNote}${errorNote}`;
+  toast(sectionErrors.length ? 'Import finished with errors' : 'Master data imported');
+  setTimeout(renderMaster, sectionErrors.length ? 15000 : 2500); // leave error messages up longer
 }
 
 async function seedDemoData(){
@@ -559,6 +664,7 @@ function renderTabs(){
   const bar = document.getElementById('tabBar');
   const tabs = [];
   if (currentRole.role === 'admin' || currentRole.role === 'dataentry') tabs.push(['entry','Daily entry']);
+  tabs.push(['reports','Reports']); // every role gets this — stock & consumption, scoped to what they can see
   if (currentRole.role === 'admin' || currentRole.role === 'director') tabs.push(['dashboard','Dashboard']);
   if (currentRole.role === 'admin') tabs.push(['master','Master data']);
   bar.innerHTML = tabs.map(([k,l],i)=>`<div class="tab${i===0?' active':''}" data-view="${k}">${l}</div>`).join('');
@@ -575,6 +681,7 @@ async function switchTab(view){
   if (view === 'entry') await renderEntry();
   else if (view === 'dashboard') await renderDashboard();
   else if (view === 'master') await renderMaster();
+  else if (view === 'reports') await renderReports();
 }
 
 // ============================================================
@@ -872,7 +979,7 @@ async function renderEntry(){
       if (!confirm('Reopen this day for editing? Anyone with access can then change it until it is submitted again.')) return;
       day.status = 'draft'; delete day.submittedBy; delete day.submittedAt;
       await saveDay(currentKitchenId, currentDate);
-      renderEntry();
+      renderEntryPreservingFocus();
     });
   } else {
     bannerEl.innerHTML = '';
@@ -885,14 +992,23 @@ async function renderEntry(){
   body.appendChild(await buildTodaysMenuCard(day));
   const todaysDishes = day.selectedDishIds.map(id => menuItems.find(m=>m.id===id)).filter(Boolean);
   todaysDishes.forEach(m => body.appendChild(buildDishIngredientCard(day, m)));
-  body.appendChild(buildProvisionsCard(day));
+  body.appendChild(buildProvisionsCard(day)); // shows full table for admin, a compact rate-only form for everyone else
   body.appendChild(buildDistributionCard(day));
 
-  if (isSubmitted){
-    // lock every input once submitted — editing must go through the explicit Reopen action
+  if (isSubmitted && currentRole.role !== 'admin'){
+    // lock every input once submitted — editing must go through the explicit Reopen action.
+    // Admin is exempt: correcting an operator's mistake (a wrong GRN entry, a typo'd quantity)
+    // shouldn't require unlocking the whole day first — admin can fix it directly, in place.
     body.querySelectorAll('input, select, button').forEach(elx => elx.disabled = true);
-  } else {
+  }
+  if (!isSubmitted || currentRole.role === 'admin'){
     document.getElementById('submitCard').appendChild(buildSubmitCard(day, todaysDishes));
+  }
+  if (isSubmitted && currentRole.role === 'admin'){
+    const note = document.createElement('div'); note.className = 'note';
+    note.style.cssText = 'margin:-8px 0 12px;color:#b91c1c;font-weight:600;';
+    note.textContent = '⚠ This day is submitted, but as Admin you can still edit it directly — changes save immediately, same as any other day.';
+    document.getElementById('statusBanner').appendChild(note);
   }
 }
 
@@ -936,7 +1052,7 @@ function buildSubmitCard(day, todaysDishes){
     day.submittedAt = new Date().toISOString();
     await saveDay(currentKitchenId, currentDate);
     toast('Submitted');
-    renderEntry();
+    renderEntryPreservingFocus();
   });
   return card;
 }
@@ -968,7 +1084,7 @@ async function buildTodaysMenuCard(day){
       e.preventDefault();
       day.selectedDishIds = day.selectedDishIds.filter(id=>id!==a.dataset.remove);
       await saveDay(currentKitchenId, currentDate);
-      renderEntry();
+      renderEntryPreservingFocus();
     }));
   };
   renderChips();
@@ -1000,7 +1116,7 @@ async function buildTodaysMenuCard(day){
       }
       await saveDay(currentKitchenId, currentDate);
     }
-    renderEntry();
+    renderEntryPreservingFocus();
   });
   return card;
 }
@@ -1024,6 +1140,12 @@ function buildCampusesCard(day){
   const card = document.createElement('div');
   card.className = 'card';
   card.innerHTML = `<h2>Campuses details</h2>
+    <div class="note">Have many branches? Fill in an Excel with columns <b>Campus ID</b>, <b>Students</b>, <b>Staff</b>, <b>Sub Staff</b>, <b>Others</b> and upload it instead of typing each row — Campus ID must match what's in Master Data.</div>
+    <div class="row" style="margin-bottom:10px;">
+      <input type="file" id="campusUploadFile" accept=".xlsx,.xls">
+      <button class="sm" id="campusUploadBtn">Upload &amp; fill in</button>
+      <span class="note" id="campusUploadStatus" style="margin:0;"></span>
+    </div>
     <div class="tbl-wrap"><table>
       <thead><tr><th class="txt">Branch</th><th class="txt">Type</th><th>Students</th><th>Staff</th><th>Sub staff</th><th>Others</th><th>Total</th></tr></thead>
       <tbody></tbody></table></div>`;
@@ -1033,15 +1155,43 @@ function buildCampusesCard(day){
     const total = (+c.students||0)+(+c.staff||0)+(+c.subStaff||0)+(+c.others||0);
     const tr = document.createElement('tr');
     tr.innerHTML = `<td class="txt">${escapeAttr(b.name)}</td><td class="txt">${b.acType}</td>
-      <td><input class="cell" type="number" data-f="students" value="${c.students||0}"></td>
-      <td><input class="cell" type="number" data-f="staff" value="${c.staff||0}"></td>
-      <td><input class="cell" type="number" data-f="subStaff" value="${c.subStaff||0}"></td>
-      <td><input class="cell" type="number" data-f="others" value="${c.others||0}"></td>
+      <td><input class="cell" type="number" data-f="students" data-focus-key="${fk('campus',b.id,'students')}" value="${c.students||0}"></td>
+      <td><input class="cell" type="number" data-f="staff" data-focus-key="${fk('campus',b.id,'staff')}" value="${c.staff||0}"></td>
+      <td><input class="cell" type="number" data-f="subStaff" data-focus-key="${fk('campus',b.id,'subStaff')}" value="${c.subStaff||0}"></td>
+      <td><input class="cell" type="number" data-f="others" data-focus-key="${fk('campus',b.id,'others')}" value="${c.others||0}"></td>
       <td><b>${total}</b></td>`;
     tr.querySelectorAll('[data-f]').forEach(inp=>inp.addEventListener('change', async ()=>{
-      c[inp.dataset.f] = +inp.value||0; await saveDay(currentKitchenId, currentDate); renderEntry();
+      c[inp.dataset.f] = +inp.value||0; await saveDay(currentKitchenId, currentDate); renderEntryPreservingFocus();
     }));
     tbody.appendChild(tr);
+  });
+  card.querySelector('#campusUploadBtn').addEventListener('click', async ()=>{
+    const fileInput = card.querySelector('#campusUploadFile');
+    const status = card.querySelector('#campusUploadStatus');
+    if (!fileInput.files.length){ status.textContent = 'Choose a file first.'; return; }
+    status.textContent = 'Reading…';
+    try{
+      const buf = await fileInput.files[0].arrayBuffer();
+      const wb = XLSX.read(buf, {type:'array'});
+      const rows = XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]], {defval:null});
+      let matched = 0, unmatched = [];
+      rows.forEach(row=>{
+        const campusId = cleanImportedText(row['Campus ID'] ?? row['CAMPUS_ID'] ?? row['campus id']);
+        const b = myBranches.find(x=>x.campusId===campusId);
+        if (!b){ if (campusId) unmatched.push(campusId); return; }
+        const c = day.campuses[b.id] || (day.campuses[b.id] = {students:0,staff:0,subStaff:0,others:0,wastage:{},targetPerHeadKg:0.05});
+        c.students = +(row['Students'] ?? row['STUDENTS']) || 0;
+        c.staff = +(row['Staff'] ?? row['STAFF']) || 0;
+        c.subStaff = +(row['Sub Staff'] ?? row['SUB_STAFF']) || 0;
+        c.others = +(row['Others'] ?? row['OTHERS']) || 0;
+        matched++;
+      });
+      await saveDay(currentKitchenId, currentDate);
+      status.innerHTML = `✓ Updated ${matched} branch(es).` + (unmatched.length ? ` ⚠ ${unmatched.length} Campus ID(s) not found: ${unmatched.slice(0,5).join(', ')}${unmatched.length>5?'…':''}` : '');
+      setTimeout(renderEntry, 2000);
+    } catch(e){
+      status.textContent = 'Could not read that file: ' + (e.message||e);
+    }
   });
   addSaveControl(card, day);
   return card;
@@ -1072,12 +1222,15 @@ function buildDishIngredientCard(day, m){
       <tbody></tbody>
     </table></div>
     <div class="row" style="margin-top:8px;">
-      <select class="ingPick" style="width:260px;">
-        <option value="">— Select an ingredient from your Provisions list —</option>
-        ${availableToAdd.map(pm=>`<option value="${pm.id}">${escapeAttr(pm.name)} (${pm.uom})</option>`).join('')}
-      </select>
+      <div class="pickerWrap">
+        <input type="text" class="ingPick" placeholder="Search by ID, name, UOM or category…" style="width:340px;">
+        <div class="pickerList"></div>
+      </div>
       <button class="sm" data-addIng>+ Add ingredient</button>
     </div>`;
+
+  const ingPickInput = card.querySelector('.ingPick');
+  const ingPicker = attachProvisionPicker(ingPickInput, card.querySelector('.pickerList'), ()=>availableToAdd);
 
   const tbody = card.querySelector('tbody');
   const renderRows = ()=>{
@@ -1096,7 +1249,7 @@ function buildDishIngredientCard(day, m){
       const tr = document.createElement('tr');
       tr.innerHTML = `<td class="txt">${escapeAttr(pm.name)}</td><td class="txt">${pm.uom}</td>
         <td class="${availableForThisRow<0?'neg':''}"><b>${fmt(availableForThisRow,1)}</b></td>
-        <td><input class="cell${expected?' expected':''}" type="number" step="0.1" value="${v||''}" title="${expected?'Usually used for this dish':''}" data-max="${availableForThisRow}"></td>
+        <td><input class="cell${expected?' expected':''}" type="number" step="0.1" value="${v||''}" title="${expected?'Usually used for this dish':''}" data-max="${availableForThisRow}" data-focus-key="${fk('dish',m.id,pid)}"></td>
         <td><button class="sm danger" data-removeIng="${pid}">✕</button></td>`;
       const qtyInput = tr.querySelector('input');
       qtyInput.addEventListener('change', async (e)=>{
@@ -1111,13 +1264,13 @@ function buildDishIngredientCard(day, m){
         p.dish[m.id] = newQty;
         await saveDay(currentKitchenId, currentDate);
         await updateRecipeFromToday(m.id);
-        renderEntry();
+        renderEntryPreservingFocus();
       });
       tr.querySelector('[data-removeIng]').addEventListener('click', async ()=>{
         delete p.dish[m.id];
         await saveDay(currentKitchenId, currentDate);
         await updateRecipeFromToday(m.id);
-        renderEntry();
+        renderEntryPreservingFocus();
       });
       tbody.appendChild(tr);
     });
@@ -1125,9 +1278,8 @@ function buildDishIngredientCard(day, m){
   renderRows();
 
   card.querySelector('[data-addIng]').addEventListener('click', async ()=>{
-    const sel = card.querySelector('.ingPick');
-    const pid = sel.value;
-    if (!pid) return;
+    const pid = ingPicker.getSelectedId();
+    if (!pid){ alert('Pick an ingredient from the search list first (click a suggestion).'); return; }
     const pm = provisions.find(x=>x.id===pid);
     if (!day.provisions[pm.id]){
       const carry = await getPrevDayCarry(currentKitchenId, currentDate, pm.id);
@@ -1136,7 +1288,7 @@ function buildDishIngredientCard(day, m){
     day.provisions[pm.id].dish[m.id] = '';
     await saveDay(currentKitchenId, currentDate);
     await updateRecipeFromToday(m.id);
-    renderEntry();
+    renderEntryPreservingFocus();
   });
 
   addSaveControl(card, day);
@@ -1160,31 +1312,33 @@ function buildReceivedStockCard(day){
       <tbody>${received.map(pm=>{
         const p = day.provisions[pm.id];
         return `<tr><td class="txt">${escapeAttr(pm.name)}</td><td class="txt">${pm.uom}</td>
-          <td><input class="cell" type="number" data-pid="${pm.id}" data-f="recvVendor" value="${p.recvVendor||''}"></td>
-          <td><input class="cell" type="number" data-pid="${pm.id}" data-f="recvBulk" value="${p.recvBulk||''}"></td>
-          <td><input class="cell" type="number" data-pid="${pm.id}" data-f="recvOther" value="${p.recvOther||''}"></td>
-          <td><input class="cell" type="number" data-pid="${pm.id}" data-f="recvBakery" value="${p.recvBakery||''}"></td></tr>`;
+          <td><input class="cell" type="number" data-pid="${pm.id}" data-f="recvVendor" data-focus-key="${fk('recv',pm.id,'recvVendor')}" value="${p.recvVendor||''}"></td>
+          <td><input class="cell" type="number" data-pid="${pm.id}" data-f="recvBulk" data-focus-key="${fk('recv',pm.id,'recvBulk')}" value="${p.recvBulk||''}"></td>
+          <td><input class="cell" type="number" data-pid="${pm.id}" data-f="recvOther" data-focus-key="${fk('recv',pm.id,'recvOther')}" value="${p.recvOther||''}"></td>
+          <td><input class="cell" type="number" data-pid="${pm.id}" data-f="recvBakery" data-focus-key="${fk('recv',pm.id,'recvBakery')}" value="${p.recvBakery||''}"></td></tr>`;
       }).join('')}</tbody>
     </table></div>
     <div class="row" style="margin-top:8px;">
-      <select id="recvPick" style="width:260px;">
-        <option value="">— Select a provision from your master list —</option>
-        ${provisions.map(pm=>`<option value="${pm.id}">${escapeAttr(pm.name)} (${pm.uom})</option>`).join('')}
-      </select>
+      <div class="pickerWrap">
+        <input type="text" id="recvPick" placeholder="Search by ID, name, UOM or category…" style="width:340px;">
+        <div class="pickerList" id="recvPickList"></div>
+      </div>
       <select id="recvSource"><option value="recvVendor">Vendor</option><option value="recvBulk">Bulk store</option><option value="recvOther">Other campus</option><option value="recvBakery">Own bakery</option></select>
       <input type="number" id="recvQty" placeholder="Qty" style="width:80px;">
       <button class="sm primary" id="addRecvBtn">+ Record</button>
     </div>`;
+  const recvPicker = attachProvisionPicker(card.querySelector('#recvPick'), card.querySelector('#recvPickList'), ()=>provisions);
   card.querySelectorAll('[data-pid]').forEach(inp=>inp.addEventListener('change', async ()=>{
     const p = day.provisions[inp.dataset.pid];
     p[inp.dataset.f] = +inp.value||0;
-    await saveDay(currentKitchenId, currentDate); renderEntry();
+    await saveDay(currentKitchenId, currentDate); renderEntryPreservingFocus();
   }));
   card.querySelector('#addRecvBtn').addEventListener('click', async ()=>{
     const field = card.querySelector('#recvSource').value;
     const qty = +card.querySelector('#recvQty').value || 0;
-    const pid = card.querySelector('#recvPick').value;
-    if (!qty || !pid) return;
+    const pid = recvPicker.getSelectedId();
+    if (!qty){ alert('Enter a quantity.'); return; }
+    if (!pid){ alert('Pick a provision from the search list first (click a suggestion).'); return; }
     const pm = provisions.find(x=>x.id===pid);
     if (!day.provisions[pm.id]){
       const carry = await getPrevDayCarry(currentKitchenId, currentDate, pm.id);
@@ -1192,7 +1346,7 @@ function buildReceivedStockCard(day){
     }
     day.provisions[pm.id][field] = (+day.provisions[pm.id][field]||0) + qty;
     await saveDay(currentKitchenId, currentDate);
-    renderEntry();
+    renderEntryPreservingFocus();
   });
   addSaveControl(card, day);
   return card;
@@ -1202,6 +1356,14 @@ function buildReceivedStockCard(day){
 // forward and nonzero, received today, or used in a dish) are shown, so this stays
 // short even with hundreds of provisions in the master list. Opening/Rate/Issued
 // stay editable here since they aren't tied to any one dish.
+// Aggregate view of the day — only provisions with SOME activity (opening carried
+// forward and nonzero, received today, or used in a dish) are shown, so this stays
+// short even with hundreds of provisions in the master list. Opening/Rate/Issued
+// stay editable here since they aren't tied to any one dish.
+// Data-entry doesn't need to see this whole table day-to-day (their Excel export covers
+// the same ground, on demand) — only Admin sees it inline, for oversight. Everyone still
+// gets a compact "update today's rate" control, since that's the one thing here that
+// isn't editable anywhere else.
 function buildProvisionsCard(day){
   const activeProvisions = provisions.filter(pm=>{
     const p = day.provisions[pm.id];
@@ -1211,15 +1373,34 @@ function buildProvisionsCard(day){
   });
   const card = document.createElement('div');
   card.className = 'card';
+  const rateFormHtml = `<div class="row" style="margin-top:8px;">
+      <div class="pickerWrap">
+        <input type="text" id="ratePick" placeholder="Search a provision to update its rate…" style="width:340px;">
+        <div class="pickerList" id="ratePickList"></div>
+      </div>
+      <input type="number" id="rateNewVal" step="0.01" placeholder="New rate ₹" style="width:100px;">
+      <button class="sm primary" id="updateRateBtn">Update rate</button>
+    </div>`;
+
+  if (currentRole.role !== 'admin'){
+    card.innerHTML = `<h2>Today's rates</h2>
+      <div class="note">Full provisions summary isn't shown here — use "📥 Download Excel" above for the complete picture. You can still update a rate directly:</div>
+      ${rateFormHtml}`;
+    wireRateForm(card, day);
+    return card;
+  }
+
   if (!activeProvisions.length){
-    card.innerHTML = `<h2>Provisions summary</h2><div class="note">Nothing recorded yet today — add dishes above and their ingredients, or record received stock.</div>`;
+    card.innerHTML = `<h2>Provisions summary</h2><div class="note">Nothing recorded yet today — add dishes above and their ingredients, or record received stock.</div>${rateFormHtml}`;
+    wireRateForm(card, day);
     return card;
   }
   card.innerHTML = `<h2>Provisions summary</h2>
     <div class="tbl-wrap"><table>
       <thead><tr><th class="txt">Provision</th><th>UOM</th><th>Opening</th><th>Received</th><th>Total qty</th>
         <th>Issued</th><th>Total cons.</th><th>Rate</th><th>Total cost</th><th>Closing</th></tr></thead>
-      <tbody></tbody></table></div>`;
+      <tbody></tbody></table></div>
+    ${rateFormHtml}`;
   const tbody = card.querySelector('tbody');
   activeProvisions.forEach(pm=>{
     const p = day.provisions[pm.id];
@@ -1227,22 +1408,23 @@ function buildProvisionsCard(day){
     const recvTotal = (+p.recvVendor||0)+(+p.recvBulk||0)+(+p.recvOther||0)+(+p.recvBakery||0);
     const tr = document.createElement('tr');
     tr.innerHTML = `<td class="txt">${escapeAttr(pm.name)}</td><td class="txt">${pm.uom}</td>
-      <td><input class="cell${p._openingIsCarried?' chained':''}" type="number" data-f="opening" value="${p.opening}"></td>
+      <td><input class="cell${p._openingIsCarried?' chained':''}" type="number" data-f="opening" data-focus-key="${fk('provsum',pm.id,'opening')}" value="${p.opening}"></td>
       <td>${fmt(recvTotal,1)}</td>
       <td><b>${fmt(t.totalQty,1)}</b></td>
-      <td><input class="cell" type="number" data-f="issued" value="${p.issued||''}"></td>
+      <td><input class="cell" type="number" data-f="issued" data-focus-key="${fk('provsum',pm.id,'issued')}" value="${p.issued||''}"></td>
       <td><b>${fmt(t.totalCons,1)}</b></td>
-      <td><input class="cell" type="number" step="0.01" data-f="rate" value="${p.rate}"></td>
+      <td><input class="cell" type="number" step="0.01" data-f="rate" data-focus-key="${fk('provsum',pm.id,'rate')}" value="${p.rate}"></td>
       <td>${fmtMoney(t.totalCost)}</td>
       <td class="${t.closing<0?'neg':''}"><b>${fmt(t.closing,1)}</b></td>`;
     tr.querySelectorAll('[data-f]').forEach(inp=>inp.addEventListener('change', async ()=>{
       p[inp.dataset.f] = +inp.value||0;
       if (inp.dataset.f==='opening') p._openingIsCarried=false;
       if (inp.dataset.f==='rate') p._rateIsCarried=false;
-      await saveDay(currentKitchenId, currentDate); renderEntry();
+      await saveDay(currentKitchenId, currentDate); renderEntryPreservingFocus();
     }));
     tbody.appendChild(tr);
   });
+  wireRateForm(card, day);
   return card;
 }
 
@@ -1260,6 +1442,27 @@ async function updateRecipeFromToday(menuItemId){
   const rec = { kitchenId: currentKitchenId, menuItemId, ingredients, updatedFrom: currentDate };
   recipes[recId] = rec;
   await dbSet('recipes', recId, rec);
+}
+
+function wireRateForm(card, day){
+  const ratePicker = attachProvisionPicker(card.querySelector('#ratePick'), card.querySelector('#ratePickList'), ()=>provisions);
+  card.querySelector('#updateRateBtn').addEventListener('click', async ()=>{
+    const pid = ratePicker.getSelectedId();
+    const newRate = +card.querySelector('#rateNewVal').value;
+    if (!pid){ alert('Pick a provision from the search list first (click a suggestion).'); return; }
+    if (!newRate || newRate <= 0){ alert('Enter a rate greater than 0.'); return; }
+    if (!day.provisions[pid]){
+      const pm = provisions.find(p=>p.id===pid);
+      const carry = await getPrevDayCarry(currentKitchenId, currentDate, pid);
+      day.provisions[pid] = { opening: carry?carry.closing:0, recvVendor:0,recvBulk:0,recvOther:0,recvBakery:0, issued:0, rate: newRate, dish:{}, _openingIsCarried:!!carry, _rateIsCarried:false };
+    } else {
+      day.provisions[pid].rate = newRate;
+      day.provisions[pid]._rateIsCarried = false;
+    }
+    await saveDay(currentKitchenId, currentDate);
+    toast('Rate updated');
+    renderEntryPreservingFocus();
+  });
 }
 
 function buildDistributionCard(day){
@@ -1286,7 +1489,7 @@ function buildDistributionCard(day){
     tr.innerHTML = `<td class="txt">${escapeAttr(m.name)}</td><td>${fmtMoney(cost)}</td><td>${recipStrength}</td><td><b>${fmt(perHead,3)}</b></td>
       ${myBranches.map(b=>{ const v = flags[b.id]==='N'?'N':'Y'; return `<td><select class="cell yn ${v.toLowerCase()}" data-branch="${b.id}"><option ${v==='Y'?'selected':''}>Y</option><option ${v==='N'?'selected':''}>N</option></select></td>`; }).join('')}`;
     tr.querySelectorAll('[data-branch]').forEach(sel=>sel.addEventListener('change', async ()=>{
-      flags[sel.dataset.branch] = sel.value; await saveDay(currentKitchenId, currentDate); renderEntry();
+      flags[sel.dataset.branch] = sel.value; await saveDay(currentKitchenId, currentDate); renderEntryPreservingFocus();
     }));
     tbody.appendChild(tr);
   });
@@ -1297,9 +1500,9 @@ async function exportDayToExcel(){
   const day = await ensureDayInitialized(currentKitchenId, currentDate);
   const kitchenName = (kitchens.find(k=>k.id===currentKitchenId)||{}).name || currentKitchenId;
   const wb = XLSX.utils.book_new();
-  const provRows = [['Provision','UOM','Opening','Received','Total Qty','Issued','Total Consumption','Rate','Total Cost','Closing']];
+  const provRows = [['Provision ID','Provision','UOM','Category','Opening','Received','Total Qty','Issued','Total Consumption','Rate','Total Cost','Closing']];
   provisions.forEach(pm=>{ const p=day.provisions[pm.id]; const t=computeTotals(p);
-    provRows.push([pm.name, pm.uom, p.opening, p.recvVendor||0, t.totalQty, p.issued||0, t.totalCons, p.rate, t.totalCost, t.closing]); });
+    provRows.push([pm.provisionId||'', pm.name, pm.uom, pm.category, p.opening, p.recvVendor||0, t.totalQty, p.issued||0, t.totalCons, p.rate, t.totalCost, t.closing]); });
   XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(provRows), 'Provisions');
   const branchRows = [['Branch','Type','Students','Staff','Sub Staff','Others','Total']];
   branches.filter(b=>b.kitchenId===currentKitchenId).forEach(b=>{ const c=day.campuses[b.id]||{};
@@ -1311,23 +1514,82 @@ async function exportDayToExcel(){
 // ============================================================
 // DASHBOARD
 // ============================================================
+// Computes every per-head metric for ONE kitchen on ONE date — used both for the single-day
+// dashboard view and, looped across a range, for the Period Average (with zero-days excluded
+// from each average, per your correction).
+const CATEGORY_DEFS = [
+  ['Rice', 'rice', p=>p.category==='RICE'],
+  ['Milk & Curd', 'milkCurd', p=>p.category==='MILK'||p.category==='CURD'],
+  ['Gas & Diesel', 'gasDiesel', p=>p.category==='GAS / DIESEL'],
+  ['Firewood & Pillets', 'firewood', p=>p.category==='PILLETS / FIREWOOD'],
+];
+async function computeDayMetrics(kitchenId, date){
+  const day = await ensureDayInitialized(kitchenId, date);
+  const myBranches = branches.filter(b => b.kitchenId === kitchenId);
+  const todaysDishes = day.selectedDishIds.map(id => menuItems.find(m=>m.id===id)).filter(Boolean);
+
+  const dishInfo = {};
+  todaysDishes.forEach(m=>{
+    const flags = day.distribution[m.id] || {};
+    let cost = 0;
+    provisions.forEach(pm=>{ const q=(day.provisions[pm.id].dish||{})[m.id]; if(q) cost += (+q)*(+day.provisions[pm.id].rate||0); });
+    dishInfo[m.id] = {cost, flags};
+  });
+  const branchStrength = {};
+  myBranches.forEach(b=>{ const c=day.campuses[b.id]||{}; branchStrength[b.id]=(+c.students||0)+(+c.staff||0)+(+c.subStaff||0)+(+c.others||0); });
+  const dishRecipStrength = {};
+  todaysDishes.forEach(m=>{ let s=0; myBranches.forEach(b=>{ if((dishInfo[m.id].flags[b.id]||'Y')!=='N') s+=branchStrength[b.id]; }); dishRecipStrength[m.id]=s; });
+  const branchPerHead = {};
+  myBranches.forEach(b=>{ let total=0; todaysDishes.forEach(m=>{ if((dishInfo[m.id].flags[b.id]||'Y')!=='N' && dishRecipStrength[m.id]>0) total += dishInfo[m.id].cost/dishRecipStrength[m.id]; }); branchPerHead[b.id]=total; });
+
+  const kitchenTotalStrength = myBranches.reduce((s,b)=>s+branchStrength[b.id],0);
+  const sessionActual = {};
+  SESSIONS.forEach(s=>{
+    let cost = 0;
+    todaysDishes.filter(m=>m.session===s).forEach(m=> cost += dishInfo[m.id].cost);
+    sessionActual[s] = kitchenTotalStrength>0 ? cost/kitchenTotalStrength : 0;
+  });
+  const categoryActual = {};
+  CATEGORY_DEFS.forEach(([label,key,matchFn])=>{
+    let cost = 0;
+    provisions.filter(matchFn).forEach(pm=>{
+      const p = day.provisions[pm.id];
+      if (p) Object.values(p.dish||{}).forEach(q=>{ if(q) cost += (+q)*(+p.rate||0); });
+    });
+    categoryActual[key] = kitchenTotalStrength>0 ? cost/kitchenTotalStrength : 0;
+  });
+  const acTypeActual = {};
+  AC_TYPES.forEach(t=>{
+    const bs = myBranches.filter(b=>b.acType===t);
+    const strength = bs.reduce((s,b)=>s+branchStrength[b.id],0);
+    const cost = bs.reduce((s,b)=>s+branchPerHead[b.id]*branchStrength[b.id],0);
+    acTypeActual[t] = strength>0 ? cost/strength : 0;
+  });
+  const overallCost = myBranches.reduce((s,b)=>s+branchPerHead[b.id]*branchStrength[b.id],0);
+  const overallPerHead = kitchenTotalStrength>0 ? overallCost/kitchenTotalStrength : 0;
+
+  return { day, myBranches, todaysDishes, dishInfo, branchStrength, branchPerHead, kitchenTotalStrength, sessionActual, categoryActual, acTypeActual, overallPerHead };
+}
+
 async function renderDashboard(){
   const el = document.getElementById('view-dashboard');
   const myKitchens = kitchens.filter(k => myKitchenIds().includes(k.id));
   if (!currentKitchenId && myKitchens.length) currentKitchenId = myKitchens[0].id;
+  if (reportFromDate === null) reportFromDate = addDays(currentDate, -6);
+  if (reportToDate === null) reportToDate = currentDate;
   el.innerHTML = `
     <div class="card"><div class="row">
       ${myKitchens.length > 1 ? `<label>Kitchen</label><select id="dashKitchen">${myKitchens.map(k=>`<option value="${k.id}" ${k.id===currentKitchenId?'selected':''}>${escapeAttr(k.name)}</option>`).join('')}</select>` : `<b>${myKitchens[0]?escapeAttr(myKitchens[0].name):'No kitchen'}</b>`}
       <label>Date</label><input type="date" id="dashDate" value="${currentDate}">
-      <label style="margin-left:14px">Consumption report: from</label><input type="date" id="repFrom" value="${addDays(currentDate,-6)}">
-      <label>to</label><input type="date" id="repTo" value="${currentDate}">
+      <label style="margin-left:14px">Consumption report: from</label><input type="date" id="repFrom" value="${reportFromDate}">
+      <label>to</label><input type="date" id="repTo" value="${reportToDate}">
     </div></div>
     <div id="dashBody"></div>`;
   const kSel = el.querySelector('#dashKitchen');
   if (kSel) kSel.addEventListener('change', e=>{ currentKitchenId = e.target.value; renderDashboard(); });
   el.querySelector('#dashDate').addEventListener('change', e=>{ currentDate = e.target.value; renderDashboard(); });
-  el.querySelector('#repFrom').addEventListener('change', renderDashboard);
-  el.querySelector('#repTo').addEventListener('change', renderDashboard);
+  el.querySelector('#repFrom').addEventListener('change', e=>{ reportFromDate = e.target.value; renderDashboard(); });
+  el.querySelector('#repTo').addEventListener('change', e=>{ reportToDate = e.target.value; renderDashboard(); });
 
   // Bird's-eye view across every kitchen you have access to — genuinely useful once you're
   // overseeing dozens of kitchens, not just one. Deliberately lightweight: reads each
@@ -1372,7 +1634,8 @@ async function renderDashboard(){
   const day = await ensureDayInitialized(currentKitchenId, currentDate);
   const myBranches = branches.filter(b => b.kitchenId === currentKitchenId);
   const todaysDishes = day.selectedDishIds.map(id => menuItems.find(m=>m.id===id)).filter(Boolean);
-  const target = (await dbGet('targets', currentKitchenId)) || {AC:0,'SEMI-AC':0,'NON-AC':0};
+  let target = {AC:0,'SEMI-AC':0,'NON-AC':0};
+  try{ target = (await dbGet('targets', currentKitchenId)) || target; } catch(e){ console.warn('targets read failed (permissions?)', e); }
 
   const dishInfo = {};
   todaysDishes.forEach(m=>{
@@ -1411,7 +1674,8 @@ async function renderDashboard(){
   body.appendChild(scCard);
 
   // --- Session & Category targets (matches your existing Target Per Head sheet) ---
-  const sessionTarget = (await dbGet('sessionTargets', currentKitchenId)) || {};
+  let sessionTarget = {};
+  try{ sessionTarget = (await dbGet('sessionTargets', currentKitchenId)) || {}; } catch(e){ console.warn('sessionTargets read failed (permissions?)', e); }
   const kitchenTotalStrengthForTargets = myBranches.reduce((s,b)=>s+branchStrength[b.id],0);
   const sessionActual = {};
   SESSIONS.forEach(s=>{
@@ -1574,33 +1838,111 @@ async function renderDashboard(){
         return `<tr><td class="txt">${escapeAttr(b.name)}</td><td>${fmt(branchWaste[b.id],2)}</td><td>${fmt(tgt,3)}</td><td class="${over?'neg':''}"><b>${fmt(actual,3)}</b></td></tr>`; }).join('')}</tbody></table></div>`;
   body.appendChild(wCard);
 
-  // --- In-hand stock (current closing balance of every provision) ---
-  const stockCard = document.createElement('div'); stockCard.className='card';
-  stockCard.innerHTML = `<h2>In-hand stock — as of ${ddmmyyyy(currentDate)}</h2>
+  body.appendChild(await buildStockCard(currentKitchenId, currentDate));
+  body.appendChild(await buildPeriodAverageCard(currentKitchenId, reportFromDate, reportToDate));
+  body.appendChild(await buildConsumptionCard(currentKitchenId, reportFromDate, reportToDate));
+}
+
+// --- In-hand stock (current closing balance of every provision) — shared by Dashboard and Reports ---
+async function buildStockCard(kitchenId, date){
+  const day = await ensureDayInitialized(kitchenId, date);
+  const card = document.createElement('div'); card.className='card';
+  card.innerHTML = `<h2>In-hand stock — as of ${ddmmyyyy(date)}</h2>
     <div class="tbl-wrap"><table><thead><tr><th class="txt">Provision</th><th class="txt">Category</th><th>UOM</th><th>Closing balance</th><th>Value ₹</th></tr></thead>
       <tbody>${provisions.map(pm=>{ const p=day.provisions[pm.id]; const t=computeTotals(p);
         return `<tr><td class="txt">${escapeAttr(pm.name)}</td><td class="txt">${escapeAttr(pm.category)}</td><td class="txt">${pm.uom}</td><td class="${t.closing<0?'neg':''}"><b>${fmt(t.closing,1)}</b></td><td>${fmtMoney(t.closing*(+p.rate||0))}</td></tr>`; }).join('')}</tbody></table></div>`;
-  body.appendChild(stockCard);
+  return card;
+}
 
-  // --- Provision-wise consumption report over a date range ---
-  const fromDate = document.getElementById('repFrom').value;
-  const toDate = document.getElementById('repTo').value;
+// --- Provision-wise consumption report over a date range — shared by Dashboard and Reports ---
+async function buildConsumptionCard(kitchenId, fromDate, toDate){
   const consTotals = {};
   provisions.forEach(pm=>consTotals[pm.id]={qty:0,cost:0});
-  let d = fromDate;
-  let guard = 0;
+  let d = fromDate; let guard = 0;
   while (d <= toDate && guard < 370){
-    const dd = await getDay(currentKitchenId, d);
+    const dd = await getDay(kitchenId, d);
     provisions.forEach(pm=>{
       const p = dd.provisions[pm.id];
       if (p){ const t = computeTotals(p); consTotals[pm.id].qty += t.totalCons; consTotals[pm.id].cost += t.totalCost; }
     });
     d = addDays(d, 1); guard++;
   }
-  const consCard = document.createElement('div'); consCard.className='card';
-  consCard.innerHTML = `<h2>Provision-wise consumption — ${ddmmyyyy(fromDate)} to ${ddmmyyyy(toDate)}</h2>
+  const card = document.createElement('div'); card.className='card';
+  card.innerHTML = `<h2>Provision-wise consumption — ${ddmmyyyy(fromDate)} to ${ddmmyyyy(toDate)}</h2>
     <div class="tbl-wrap"><table><thead><tr><th class="txt">Provision</th><th class="txt">Category</th><th>Total consumed</th><th>Total cost ₹</th></tr></thead>
       <tbody>${provisions.map(pm=>`<tr><td class="txt">${escapeAttr(pm.name)}</td><td class="txt">${escapeAttr(pm.category)}</td><td>${fmt(consTotals[pm.id].qty,1)}</td><td>${fmtMoney(consTotals[pm.id].cost)}</td></tr>`).join('')}</tbody></table></div>`;
+  return card;
+}
+
+// --- Period Average — averages EXCLUDING zero-days, so a stretch with no entries doesn't
+// drag a real average down (35, 0, 45, 55 averages to 45 — the three days with activity —
+// not 33.75 across all four).
+async function buildPeriodAverageCard(kitchenId, fromDate, toDate){
+  const bySession = {}; SESSIONS.forEach(s=>bySession[s]=[]);
+  const byCategory = {}; CATEGORY_DEFS.forEach(([l,k])=>byCategory[k]=[]);
+  const byAcType = {}; AC_TYPES.forEach(t=>byAcType[t]=[]);
+  const overallVals = [];
+  let d = fromDate, guard = 0, daysWithAnyData = 0;
+  while (d <= toDate && guard < 370){
+    const m = await computeDayMetrics(kitchenId, d);
+    if (m.kitchenTotalStrength > 0) daysWithAnyData++;
+    SESSIONS.forEach(s=>bySession[s].push(m.sessionActual[s]));
+    CATEGORY_DEFS.forEach(([l,k])=>byCategory[k].push(m.categoryActual[k]));
+    AC_TYPES.forEach(t=>byAcType[t].push(m.acTypeActual[t]));
+    overallVals.push(m.overallPerHead);
+    d = addDays(d, 1); guard++;
+  }
+  const card = document.createElement('div'); card.className='card';
+  card.innerHTML = `<h2>Period average — ${ddmmyyyy(fromDate)} to ${ddmmyyyy(toDate)}</h2>
+    <div class="note">Days with no entry are left out of each average below, not counted as ₹0 — so a gap in reporting never drags the average down.</div>
+    <div class="grid4" style="margin-bottom:10px;">
+      <div class="metric" style="background:#eef2ff;"><div class="lbl">Overall ₹/head</div><div class="val">${fmt(avgExcludingZero(overallVals),2)}</div></div>
+      ${AC_TYPES.map(t=>`<div class="metric"><div class="lbl">${t}</div><div class="val">${fmt(avgExcludingZero(byAcType[t]),2)}</div></div>`).join('')}
+    </div>
+    <div class="tbl-wrap"><table><thead><tr><th class="txt">Meal / category</th><th>Average ₹/head</th><th>Days counted</th></tr></thead>
+      <tbody>
+        ${SESSIONS.map(s=>{ const vals=bySession[s]; const nz=vals.filter(v=>v!==0); return `<tr><td class="txt">${s[0]+s.slice(1).toLowerCase()}</td><td><b>${fmt(avgExcludingZero(vals),2)}</b></td><td>${nz.length} / ${vals.length}</td></tr>`; }).join('')}
+        ${CATEGORY_DEFS.map(([label,key])=>{ const vals=byCategory[key]; const nz=vals.filter(v=>v!==0); return `<tr><td class="txt">${label}</td><td><b>${fmt(avgExcludingZero(vals),2)}</b></td><td>${nz.length} / ${vals.length}</td></tr>`; }).join('')}
+      </tbody></table></div>
+    <div class="note" style="margin-top:8px;">${daysWithAnyData} of ${overallVals.length} day(s) in this range have any recorded activity for this kitchen.</div>`;
+  return card;
+}
+
+// ============================================================
+// REPORTS — Stock-in-hand & Consumption, available to every role, scoped to what they
+// can see: data-entry gets their own kitchen only (no picker needed), admin & director
+// get every kitchen with a picker.
+// ============================================================
+async function renderReports(){
+  const el = document.getElementById('view-reports');
+  const myKitchens = kitchens.filter(k => myKitchenIds().includes(k.id));
+  if (!currentKitchenId && myKitchens.length) currentKitchenId = myKitchens[0].id;
+  if (reportFromDate === null) reportFromDate = addDays(currentDate, -6);
+  if (reportToDate === null) reportToDate = currentDate;
+  el.innerHTML = `
+    <div class="card"><div class="row">
+      ${myKitchens.length > 1 ? `<label>Kitchen</label><select id="repKitchen">${myKitchens.map(k=>`<option value="${k.id}" ${k.id===currentKitchenId?'selected':''}>${escapeAttr(k.name)}</option>`).join('')}</select>` : `<b>${myKitchens[0]?escapeAttr(myKitchens[0].name):'No kitchen'}</b>`}
+      <label>Stock as of</label><input type="date" id="repStockDate" value="${currentDate}">
+      <label style="margin-left:14px">Consumption: from</label><input type="date" id="repFrom2" value="${reportFromDate}">
+      <label>to</label><input type="date" id="repTo2" value="${reportToDate}">
+    </div></div>
+    <div id="reportsBody"></div>`;
+  const kSel = el.querySelector('#repKitchen');
+  if (kSel) kSel.addEventListener('change', e=>{ currentKitchenId = e.target.value; renderReports(); });
+  el.querySelector('#repStockDate').addEventListener('change', e=>{ currentDate = e.target.value; renderReports(); });
+  el.querySelector('#repFrom2').addEventListener('change', e=>{ reportFromDate = e.target.value; renderReports(); });
+  el.querySelector('#repTo2').addEventListener('change', e=>{ reportToDate = e.target.value; renderReports(); });
+
+  if (!currentKitchenId){ document.getElementById('reportsBody').innerHTML = '<div class="card">No kitchen assigned.</div>'; return; }
+
+  const body = document.getElementById('reportsBody');
+  body.innerHTML = '<div class="note">Loading…</div>';
+  const stockCard = await buildStockCard(currentKitchenId, currentDate);
+  const periodCard = await buildPeriodAverageCard(currentKitchenId, reportFromDate, reportToDate);
+  const consCard = await buildConsumptionCard(currentKitchenId, reportFromDate, reportToDate);
+  body.innerHTML = '';
+  body.appendChild(stockCard);
+  body.appendChild(periodCard);
   body.appendChild(consCard);
 }
 
