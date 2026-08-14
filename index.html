@@ -66,6 +66,9 @@
   .status{position:fixed;bottom:16px;right:16px;background:var(--ink);color:#fff;padding:8px 16px;border-radius:8px;font-size:12.5px;opacity:0;transition:opacity .2s;pointer-events:none;z-index:50;}
   .status.show{opacity:1;}
   .yn.y{color:var(--green);} .yn.n{color:var(--red);}
+  .badge{display:inline-block;padding:2px 8px;border-radius:6px;font-size:11px;font-weight:700;}
+  .badge.ok{background:#f0fdf4;color:#166534;}
+  .badge.over{background:#fef2f2;color:#b91c1c;}
   #loginScreen{max-width:380px;margin:80px auto;text-align:center;}
   #loginScreen .card{text-align:left;}
   .errmsg{color:var(--red);font-size:12.5px;margin-top:6px;min-height:16px;}
@@ -270,6 +273,161 @@ async function boot(){
   await switchTab(currentRole.role === 'director' ? 'dashboard' : 'entry');
 }
 
+// Strip the directional-override marks (\u202d etc.) that show up in some copy-pasted
+// provision names from the source system, and normalize whitespace/case.
+function cleanImportedText(v){
+  return String(v==null?'':v).replace(/[\u200e\u200f\u202a-\u202e]/g, '').trim();
+}
+
+async function importMasterDataFromExcel(){
+  const fileInput = document.getElementById('masterImportFile');
+  const status = document.getElementById('importStatus');
+  if (!fileInput.files.length){ status.textContent = 'Choose a file first.'; return; }
+  status.textContent = 'Reading file…';
+  const buf = await fileInput.files[0].arrayBuffer();
+  const wb = XLSX.read(buf, {type:'array', cellDates:true});
+  const sheetRows = (name) => {
+    if (!wb.SheetNames.includes(name)) return null;
+    return XLSX.utils.sheet_to_json(wb.Sheets[name], {defval:null});
+  };
+
+  let counts = {kitchens:0, provisions:0, branches:0, openingBalances:0, targets:0};
+  const kitchenCodeToId = {}; kitchens.forEach(k=>{ if (k.kitchenCode) kitchenCodeToId[k.kitchenCode]=k.id; });
+  const provisionCodeToId = {}; provisions.forEach(p=>{ if (p.provisionId) provisionCodeToId[p.provisionId]=p.id; });
+
+  // 1) Kitchens — must go first, everything else references KITCHEN_ID
+  const kRows = sheetRows('Kitchen_List');
+  if (kRows){
+    status.textContent = `Importing ${kRows.length} kitchens…`;
+    for (const row of kRows){
+      const code = cleanImportedText(row['KITCHEN_ID']);
+      if (!code) continue;
+      let id = kitchenCodeToId[code];
+      const data = {
+        stateCode: cleanImportedText(row['STATE']),
+        division: cleanImportedText(row['DIVISION']),
+        kitchenCode: code,
+        name: cleanImportedText(row['KITCHEN_NAME']),
+        bulkStoreName: cleanImportedText(row['BULK_STORE_NAME']),
+        bakeryName: cleanImportedText(row['BAKERY_NAME']),
+      };
+      if (!id){ id = newId(); kitchens.push(Object.assign({id}, data)); kitchenCodeToId[code] = id; }
+      else { Object.assign(kitchens.find(k=>k.id===id), data); }
+      await dbSet('kitchens', id, data);
+      counts.kitchens++;
+    }
+  }
+
+  // 2) Provisions
+  const pRows = sheetRows('Provision_List');
+  if (pRows){
+    status.textContent = `Importing ${pRows.length} provisions…`;
+    for (const row of pRows){
+      const code = cleanImportedText(row['PROVISION ID']);
+      if (!code) continue;
+      let id = provisionCodeToId[code];
+      const existing = id ? provisions.find(p=>p.id===id) : null;
+      const data = {
+        provisionType: cleanImportedText(row['PROVISION TYPE']),
+        provisionId: code,
+        name: cleanImportedText(row['PROVISION NAME']),
+        uom: cleanImportedText(row['UOM']),
+        category: cleanImportedText(row['CATEGORY']),
+        rate: existing ? existing.rate : 0, // rate isn't in this sheet — preserve whatever's already set
+      };
+      if (!id){ id = newId(); provisions.push(Object.assign({id}, data)); provisionCodeToId[code] = id; }
+      else { Object.assign(existing, data); }
+      await dbSet('provisions', id, data);
+      counts.provisions++;
+    }
+  }
+
+  // 3) Branches — needs the kitchen map from step 1
+  const bRows = sheetRows('Kitchen_wise_Branch_List');
+  if (bRows){
+    status.textContent = `Importing ${bRows.length} branches…`;
+    for (const row of bRows){
+      const kCode = cleanImportedText(row['KITCHEN_ID']);
+      const campusId = cleanImportedText(row['CAMPUS_ID']);
+      const kitchenId = kitchenCodeToId[kCode];
+      if (!kitchenId || !campusId) continue; // can't place a branch without a known kitchen
+      let existing = branches.find(b => b.kitchenId===kitchenId && b.campusId===campusId);
+      const data = {
+        kitchenId, campusId,
+        name: cleanImportedText(row['CAMPUS_NAME']),
+        acType: cleanImportedText(row['STU_TYPE']) || 'AC',
+        intType: cleanImportedText(row['INT_TYPE']) || 'SCHOOL',
+        foodSupplied: cleanImportedText(row['FOOD_SUPPLIED']) || 'Mandatory',
+        active: true,
+      };
+      if (!existing){ const id = newId(); existing = Object.assign({id}, data); branches.push(existing); await dbSet('branches', id, data); }
+      else { Object.assign(existing, data); await dbSet('branches', existing.id, data); }
+      counts.branches++;
+    }
+  }
+
+  // 4) Opening balances — seeds a starting day so the cascade has somewhere to carry
+  // forward from. Written straight into dailyEntries for the given date, per kitchen.
+  const obRows = sheetRows('Opening_Closing_Balance');
+  if (obRows){
+    status.textContent = `Importing ${obRows.length} opening balances…`;
+    const byKitchenDate = {}; // "kitchenId|date" -> {provisionId: opening}
+    for (const row of obRows){
+      const kCode = cleanImportedText(row['KITCHEN_ID']);
+      const pCode = cleanImportedText(row['PROVISION ID']);
+      const kitchenId = kitchenCodeToId[kCode];
+      const provisionId = provisionCodeToId[pCode];
+      if (!kitchenId || !provisionId) continue;
+      let dateVal = row['OPENING BALANCE DATE'];
+      let dateStr = (dateVal instanceof Date) ? isoDate(dateVal) : currentDate;
+      const key = kitchenId + '|' + dateStr;
+      if (!byKitchenDate[key]) byKitchenDate[key] = {};
+      byKitchenDate[key][provisionId] = +row['OPENING BALANCE'] || 0;
+      counts.openingBalances++;
+    }
+    for (const key of Object.keys(byKitchenDate)){
+      const [kitchenId, dateStr] = key.split('|');
+      const day = await getDay(kitchenId, dateStr);
+      Object.entries(byKitchenDate[key]).forEach(([provisionId, opening])=>{
+        if (!day.provisions[provisionId]){
+          const pm = provisions.find(p=>p.id===provisionId);
+          day.provisions[provisionId] = { opening, recvVendor:0,recvBulk:0,recvOther:0,recvBakery:0, issued:0, rate: pm?pm.rate:0, dish:{}, _openingIsCarried:false, _rateIsCarried:false };
+        } else {
+          day.provisions[provisionId].opening = opening;
+        }
+      });
+      await saveDay(kitchenId, dateStr);
+    }
+  }
+
+  // 5) Session & category targets
+  const tRows = sheetRows('Targets');
+  if (tRows){
+    status.textContent = `Importing ${tRows.length} target rows…`;
+    for (const row of tRows){
+      const kCode = cleanImportedText(row['KITCHEN_ID']);
+      const kitchenId = kitchenCodeToId[kCode];
+      if (!kitchenId) continue;
+      const data = {
+        breakfast: +row['BREAKFAST TARGET PER HEAD'] || 0,
+        lunch: +row['LUNCH TARGET PER HEAD'] || 0,
+        snacks: +row['SNACKS TARGET PER HEAD'] || 0,
+        dinner: +row['DINNER TARGET PER HEAD'] || 0,
+        rice: +row['RICE TARGET PER HEAD'] || 0,
+        milkCurd: +row['MILK & CURD TARGET PER HEAD'] || 0,
+        gasDiesel: +row['GAS & DIESEL TARGET PER HEAD'] || 0,
+        firewood: +row['FIRE WOOD & PILLETS TARGET PER HEAD'] || 0,
+      };
+      await dbSet('sessionTargets', kitchenId, data);
+      counts.targets++;
+    }
+  }
+
+  status.innerHTML = `✓ Done — ${counts.kitchens} kitchens, ${counts.provisions} provisions, ${counts.branches} branches, ${counts.openingBalances} opening balances, ${counts.targets} target rows.`;
+  toast('Master data imported');
+  setTimeout(renderMaster, 2500); // let the confirmation message stay visible briefly before the full refresh replaces it
+}
+
 async function seedDemoData(){
   const kId = newId();
   await dbSet('kitchens', kId, { name: 'MEGA KITCHEN BHARADWAJA', location: 'Hyderabad' });
@@ -329,25 +487,39 @@ async function switchTab(view){
 async function renderMaster(){
   const el = document.getElementById('view-master');
   el.innerHTML = `
+    <div class="card" style="border:2px solid #1d4ed8;">
+      <div class="toolbar"><h2>Import master data from Excel</h2></div>
+      <div class="note">Upload a workbook with sheets named exactly: <b>Kitchen_List</b>, <b>Provision_List</b>, <b>Kitchen_wise_Branch_List</b>, <b>Opening_Closing_Balance</b>, <b>Targets</b> (any subset is fine — sheets you don't include are simply skipped). Existing entries are matched by their ID column and updated; new IDs are added. Nothing is ever deleted by an import.</div>
+      <input type="file" id="masterImportFile" accept=".xlsx,.xls">
+      <button class="sm primary" id="masterImportBtn" style="margin-left:8px;">Import</button>
+      <div id="importStatus" class="note" style="margin-top:8px;"></div>
+    </div>
     <div class="card">
       <div class="toolbar"><h2>Kitchens</h2><button class="primary sm" id="addKitchenBtn">+ Add kitchen</button></div>
-      <div class="tbl-wrap"><table id="kitchenTable"><thead><tr><th class="txt">Name</th><th class="txt">Location</th><th></th></tr></thead><tbody></tbody></table></div>
+      <div class="tbl-wrap"><table id="kitchenTable"><thead><tr><th class="txt">State</th><th class="txt">Division</th><th class="txt">Kitchen ID</th><th class="txt">Name</th><th class="txt">Bulk store</th><th class="txt">Bakery</th><th></th></tr></thead><tbody></tbody></table></div>
     </div>
     <div class="card">
       <div class="toolbar"><h2>Branches</h2><button class="primary sm" id="addBranchBtn">+ Add branch</button></div>
       <div class="note">Add a branch any time — it's available on every date from today onward.</div>
-      <div class="tbl-wrap"><table id="branchTable"><thead><tr><th class="txt">Kitchen</th><th class="txt">Name</th><th class="txt">AC type</th><th></th></tr></thead><tbody></tbody></table></div>
+      <div class="tbl-wrap"><table id="branchTable"><thead><tr><th class="txt">Kitchen</th><th class="txt">Campus ID</th><th class="txt">Name</th><th class="txt">AC type</th><th class="txt">School/College</th><th class="txt">Food supplied</th><th></th></tr></thead><tbody></tbody></table></div>
     </div>
     <div class="card">
       <div class="toolbar"><h2>Menu items (dishes)</h2><button class="primary sm" id="addMenuBtn">+ Add dish</button></div>
       <div class="tbl-wrap"><table id="menuTable"><thead><tr><th class="txt">Meal</th><th class="txt">Dish name</th><th></th></tr></thead><tbody></tbody></table></div>
     </div>
     <div class="card">
-      <div class="toolbar"><h2>Provisions</h2><button class="primary sm" id="addProvBtn">+ Add provision</button></div>
-      <div class="tbl-wrap"><table id="provTable"><thead><tr><th class="txt">Category</th><th class="txt">Name</th><th class="txt">UOM</th><th>Default rate</th><th></th></tr></thead><tbody></tbody></table></div>
+      <div class="toolbar"><h2>Provisions (${provisions.length})</h2><button class="primary sm" id="addProvBtn">+ Add provision</button></div>
+      <div class="note">Showing the first 60 — use the search box to find others. Imported provisions keep their original Provision ID and Provision Type from your file.</div>
+      <input type="text" id="provSearch" placeholder="Search provisions…" style="width:260px;margin-bottom:8px;">
+      <div class="tbl-wrap"><table id="provTable"><thead><tr><th class="txt">Type</th><th class="txt">Category</th><th class="txt">ID</th><th class="txt">Name</th><th class="txt">UOM</th><th>Default rate</th><th></th></tr></thead><tbody></tbody></table></div>
     </div>
     <div class="card">
-      <div class="toolbar"><h2>Target ₹/head (per kitchen)</h2></div>
+      <div class="toolbar"><h2>Session &amp; category targets (per kitchen)</h2></div>
+      <div class="note">Matches your existing Target Per Head sheet — Breakfast/Lunch/Snacks/Dinner and Rice/Milk & Curd/Gas & Diesel/Firewood & Pillets, per kitchen.</div>
+      <div class="tbl-wrap"><table id="sessionTargetTable"><thead><tr><th class="txt">Kitchen</th><th>Breakfast</th><th>Lunch</th><th>Snacks</th><th>Dinner</th><th>Rice</th><th>Milk&Curd</th><th>Gas&Diesel</th><th>Firewood</th></tr></thead><tbody></tbody></table></div>
+    </div>
+    <div class="card">
+      <div class="toolbar"><h2>Target ₹/head — AC / Semi-AC / Non-AC (per kitchen)</h2></div>
       <div class="tbl-wrap"><table id="targetTable"><thead><tr><th class="txt">Kitchen</th><th>AC</th><th>Semi-AC</th><th>Non-AC</th></tr></thead><tbody></tbody></table></div>
     </div>
     <div class="card">
@@ -357,30 +529,39 @@ async function renderMaster(){
     </div>
   `;
 
+  el.querySelector('#masterImportBtn').addEventListener('click', importMasterDataFromExcel);
+
   const kBody = el.querySelector('#kitchenTable tbody');
   kitchens.forEach(k=>{
     const tr = document.createElement('tr');
-    tr.innerHTML = `<td class="txt"><input class="cell" style="width:220px;text-align:left" value="${escapeAttr(k.name)}" data-f="name"></td>
-      <td class="txt"><input class="cell" style="width:160px;text-align:left" value="${escapeAttr(k.location||'')}" data-f="location"></td>
+    tr.innerHTML = `<td class="txt"><input class="cell" style="width:50px;text-align:left" value="${escapeAttr(k.stateCode||'')}" data-f="stateCode"></td>
+      <td class="txt"><input class="cell" style="width:100px;text-align:left" value="${escapeAttr(k.division||'')}" data-f="division"></td>
+      <td class="txt"><input class="cell" style="width:100px;text-align:left" value="${escapeAttr(k.kitchenCode||'')}" data-f="kitchenCode"></td>
+      <td class="txt"><input class="cell" style="width:180px;text-align:left" value="${escapeAttr(k.name)}" data-f="name"></td>
+      <td class="txt"><input class="cell" style="width:140px;text-align:left" value="${escapeAttr(k.bulkStoreName||'')}" data-f="bulkStoreName"></td>
+      <td class="txt"><input class="cell" style="width:120px;text-align:left" value="${escapeAttr(k.bakeryName||'')}" data-f="bakeryName"></td>
       <td><button class="sm danger" data-del>Remove</button></td>`;
     tr.querySelectorAll('[data-f]').forEach(inp=>inp.addEventListener('change', async ()=>{ k[inp.dataset.f]=inp.value; await dbSet('kitchens', k.id, k); toast('Saved'); }));
     tr.querySelector('[data-del]').addEventListener('click', async ()=>{ if(!confirm('Remove '+k.name+'?'))return; await dbDelete('kitchens', k.id); kitchens = kitchens.filter(x=>x.id!==k.id); renderMaster(); });
     kBody.appendChild(tr);
   });
-  el.querySelector('#addKitchenBtn').addEventListener('click', async ()=>{ const id=newId(); const k={name:'NEW KITCHEN',location:''}; await dbSet('kitchens',id,k); kitchens.push(Object.assign({id},k)); renderMaster(); });
+  el.querySelector('#addKitchenBtn').addEventListener('click', async ()=>{ const id=newId(); const k={name:'NEW KITCHEN',stateCode:'',division:'',kitchenCode:'',bulkStoreName:'',bakeryName:''}; await dbSet('kitchens',id,k); kitchens.push(Object.assign({id},k)); renderMaster(); });
 
   const bBody = el.querySelector('#branchTable tbody');
   branches.forEach(b=>{
     const tr = document.createElement('tr');
     tr.innerHTML = `<td class="txt"><select class="cell" style="width:150px" data-f="kitchenId">${kitchens.map(k=>`<option value="${k.id}" ${k.id===b.kitchenId?'selected':''}>${escapeAttr(k.name)}</option>`).join('')}</select></td>
+      <td class="txt"><input class="cell" style="width:80px;text-align:left" value="${escapeAttr(b.campusId||'')}" data-f="campusId"></td>
       <td class="txt"><input class="cell" style="width:200px;text-align:left" value="${escapeAttr(b.name)}" data-f="name"></td>
       <td class="txt"><select class="cell" style="width:90px" data-f="acType">${AC_TYPES.map(t=>`<option ${t===b.acType?'selected':''}>${t}</option>`).join('')}</select></td>
+      <td class="txt"><select class="cell" style="width:90px" data-f="intType"><option ${b.intType==='SCHOOL'?'selected':''}>SCHOOL</option><option ${b.intType==='COLLEGE'?'selected':''}>COLLEGE</option></select></td>
+      <td class="txt"><select class="cell" style="width:90px" data-f="foodSupplied"><option ${b.foodSupplied==='Mandatory'?'selected':''}>Mandatory</option><option ${b.foodSupplied==='Optional'?'selected':''}>Optional</option></select></td>
       <td><button class="sm danger" data-del>Remove</button></td>`;
     tr.querySelectorAll('[data-f]').forEach(inp=>inp.addEventListener('change', async ()=>{ b[inp.dataset.f]=inp.value; await dbSet('branches', b.id, b); toast('Saved'); }));
     tr.querySelector('[data-del]').addEventListener('click', async ()=>{ if(!confirm('Remove '+b.name+'?'))return; await dbDelete('branches', b.id); branches = branches.filter(x=>x.id!==b.id); renderMaster(); });
     bBody.appendChild(tr);
   });
-  el.querySelector('#addBranchBtn').addEventListener('click', async ()=>{ const id=newId(); const b={kitchenId:kitchens[0]?.id||'',name:'NEW BRANCH',acType:'AC',active:true}; await dbSet('branches',id,b); branches.push(Object.assign({id},b)); renderMaster(); });
+  el.querySelector('#addBranchBtn').addEventListener('click', async ()=>{ const id=newId(); const b={kitchenId:kitchens[0]?.id||'',campusId:'',name:'NEW BRANCH',acType:'AC',intType:'SCHOOL',foodSupplied:'Mandatory',active:true}; await dbSet('branches',id,b); branches.push(Object.assign({id},b)); renderMaster(); });
 
   const mBody = el.querySelector('#menuTable tbody');
   menuItems.forEach(m=>{
@@ -394,19 +575,45 @@ async function renderMaster(){
   });
   el.querySelector('#addMenuBtn').addEventListener('click', async ()=>{ const id=newId(); const m={session:'BREAKFAST',name:'NEW DISH'}; await dbSet('menuItems',id,m); menuItems.push(Object.assign({id},m)); renderMaster(); });
 
-  const pBody = el.querySelector('#provTable tbody');
-  provisions.forEach(p=>{
+  const renderProvRows = (filterText)=>{
+    const pBody = el.querySelector('#provTable tbody');
+    pBody.innerHTML = '';
+    const ft = (filterText||'').toUpperCase();
+    const filtered = provisions.filter(p => !ft || p.name.includes(ft) || (p.provisionId||'').includes(ft));
+    filtered.slice(0,60).forEach(p=>{
+      const tr = document.createElement('tr');
+      tr.innerHTML = `<td class="txt"><input class="cell" style="width:90px;text-align:left" value="${escapeAttr(p.provisionType||'')}" data-f="provisionType"></td>
+        <td class="txt"><input class="cell" style="width:90px;text-align:left" value="${escapeAttr(p.category)}" data-f="category"></td>
+        <td class="txt">${escapeAttr(p.provisionId||'')}</td>
+        <td class="txt"><input class="cell" style="width:200px;text-align:left" value="${escapeAttr(p.name)}" data-f="name"></td>
+        <td class="txt"><input class="cell" style="width:60px;text-align:left" value="${escapeAttr(p.uom)}" data-f="uom"></td>
+        <td><input type="number" class="cell" value="${p.rate}" step="0.01" data-f="rate"></td>
+        <td><button class="sm danger" data-del>Remove</button></td>`;
+      tr.querySelectorAll('[data-f]').forEach(inp=>inp.addEventListener('change', async ()=>{ p[inp.dataset.f]= inp.type==='number' ? (+inp.value||0) : inp.value.toUpperCase(); await dbSet('provisions', p.id, p); toast('Saved'); }));
+      tr.querySelector('[data-del]').addEventListener('click', async ()=>{ if(!confirm('Remove '+p.name+'?'))return; await dbDelete('provisions', p.id); provisions = provisions.filter(x=>x.id!==p.id); renderMaster(); });
+      pBody.appendChild(tr);
+    });
+    if (filtered.length > 60) {
+      const tr = document.createElement('tr'); tr.innerHTML = `<td colspan="7" class="note" style="text-align:center;">…and ${filtered.length-60} more — narrow your search to see them</td>`;
+      pBody.appendChild(tr);
+    }
+  };
+  renderProvRows('');
+  el.querySelector('#provSearch').addEventListener('input', (e)=>renderProvRows(e.target.value));
+  el.querySelector('#addProvBtn').addEventListener('click', async ()=>{ const id=newId(); const p={provisionType:'PROVISIONS',category:'PROVISIONS',name:'NEW ITEM',uom:'KG',rate:0}; await dbSet('provisions',id,p); provisions.push(Object.assign({id},p)); renderMaster(); });
+
+  const allSessionTargets = await dbGetAll('sessionTargets');
+  const stBody = el.querySelector('#sessionTargetTable tbody');
+  kitchens.forEach(k=>{
+    const t = allSessionTargets.find(x=>x.id===k.id) || {};
+    const fields = ['breakfast','lunch','snacks','dinner','rice','milkCurd','gasDiesel','firewood'];
     const tr = document.createElement('tr');
-    tr.innerHTML = `<td class="txt"><input class="cell" style="width:110px;text-align:left" value="${escapeAttr(p.category)}" data-f="category"></td>
-      <td class="txt"><input class="cell" style="width:200px;text-align:left" value="${escapeAttr(p.name)}" data-f="name"></td>
-      <td class="txt"><input class="cell" style="width:60px;text-align:left" value="${escapeAttr(p.uom)}" data-f="uom"></td>
-      <td><input type="number" class="cell" value="${p.rate}" step="0.01" data-f="rate"></td>
-      <td><button class="sm danger" data-del>Remove</button></td>`;
-    tr.querySelectorAll('[data-f]').forEach(inp=>inp.addEventListener('change', async ()=>{ p[inp.dataset.f]= inp.type==='number' ? (+inp.value||0) : inp.value.toUpperCase(); await dbSet('provisions', p.id, p); toast('Saved'); }));
-    tr.querySelector('[data-del]').addEventListener('click', async ()=>{ if(!confirm('Remove '+p.name+'?'))return; await dbDelete('provisions', p.id); provisions = provisions.filter(x=>x.id!==p.id); renderMaster(); });
-    pBody.appendChild(tr);
+    tr.innerHTML = `<td class="txt">${escapeAttr(k.name)}</td>` + fields.map(f=>`<td><input class="cell" type="number" step="0.01" data-f="${f}" value="${t[f]||0}"></td>`).join('');
+    tr.querySelectorAll('[data-f]').forEach(inp=>inp.addEventListener('change', async ()=>{
+      t[inp.dataset.f] = +inp.value||0; await dbSet('sessionTargets', k.id, t); toast('Saved');
+    }));
+    stBody.appendChild(tr);
   });
-  el.querySelector('#addProvBtn').addEventListener('click', async ()=>{ const id=newId(); const p={category:'PROVISIONS',name:'NEW ITEM',uom:'KG',rate:0}; await dbSet('provisions',id,p); provisions.push(Object.assign({id},p)); renderMaster(); });
 
   const allTargets = await dbGetAll('targets');
   const tgtBody = el.querySelector('#targetTable tbody');
@@ -963,6 +1170,45 @@ async function renderDashboard(){
 
   const body = document.getElementById('dashBody');
   body.innerHTML = '';
+
+  // --- Session & Category targets (matches your existing Target Per Head sheet) ---
+  const sessionTarget = (await dbGet('sessionTargets', currentKitchenId)) || {};
+  const kitchenTotalStrengthForTargets = myBranches.reduce((s,b)=>s+branchStrength[b.id],0);
+  const sessionActual = {};
+  SESSIONS.forEach(s=>{
+    let cost = 0;
+    todaysDishes.filter(m=>m.session===s).forEach(m=> cost += dishInfo[m.id].cost);
+    sessionActual[s] = kitchenTotalStrengthForTargets>0 ? cost/kitchenTotalStrengthForTargets : 0;
+  });
+  const categoryDefs = [
+    ['Rice', 'rice', p=>p.category==='RICE'],
+    ['Milk & Curd', 'milkCurd', p=>p.category==='MILK'||p.category==='CURD'],
+    ['Gas & Diesel', 'gasDiesel', p=>p.category==='GAS / DIESEL'],
+    ['Firewood & Pillets', 'firewood', p=>p.category==='PILLETS / FIREWOOD'],
+  ];
+  const categoryActual = {};
+  categoryDefs.forEach(([label,key,matchFn])=>{
+    let cost = 0;
+    provisions.filter(matchFn).forEach(pm=>{
+      const p = day.provisions[pm.id];
+      if (p) Object.values(p.dish||{}).forEach(q=>{ if(q) cost += (+q)*(+p.rate||0); });
+    });
+    categoryActual[key] = kitchenTotalStrengthForTargets>0 ? cost/kitchenTotalStrengthForTargets : 0;
+  });
+  const stCard = document.createElement('div'); stCard.className='card';
+  stCard.innerHTML = `<h2>Session &amp; category — actual vs target ₹/head</h2>
+    <div class="tbl-wrap"><table><thead><tr><th class="txt">Meal / category</th><th>Actual</th><th>Target</th><th>Status</th></tr></thead>
+    <tbody>
+      ${SESSIONS.map(s=>{
+        const actual = sessionActual[s]; const tgt = sessionTarget[s.toLowerCase()]||0; const over = tgt>0 && actual>tgt;
+        return `<tr><td class="txt">${s[0]+s.slice(1).toLowerCase()}</td><td><b>${fmt(actual,2)}</b></td><td>${tgt?fmt(tgt,2):'—'}</td><td>${tgt?(over?'<span class="badge over">⚠ over</span>':'<span class="badge ok">✓ within</span>'):'—'}</td></tr>`;
+      }).join('')}
+      ${categoryDefs.map(([label,key])=>{
+        const actual = categoryActual[key]; const tgt = sessionTarget[key]||0; const over = tgt>0 && actual>tgt;
+        return `<tr><td class="txt">${label}</td><td><b>${fmt(actual,2)}</b></td><td>${tgt?fmt(tgt,2):'—'}</td><td>${tgt?(over?'<span class="badge over">⚠ over</span>':'<span class="badge ok">✓ within</span>'):'—'}</td></tr>`;
+      }).join('')}
+    </tbody></table></div>`;
+  body.appendChild(stCard);
 
   // --- AC / Semi-AC / Non-AC vs Target ---
   const catCard = document.createElement('div'); catCard.className='card';
