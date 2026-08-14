@@ -764,7 +764,7 @@ async function renderMaster(){
 // (never the quantity) — quantity is always typed fresh, since consumption varies daily.
 // ============================================================
 function dayDocId(kitchenId, date){ return kitchenId + '_' + date; }
-function emptyDay(kitchenId, date){ return { kitchenId, date, selectedDishIds:[], provisions:{}, campuses:{}, distribution:{} }; }
+function emptyDay(kitchenId, date){ return { kitchenId, date, status:'draft', selectedDishIds:[], provisions:{}, campuses:{}, distribution:{} }; }
 function recipeDocId(kitchenId, menuItemId){ return kitchenId + '::' + menuItemId; }
 
 async function getDay(kitchenId, date){
@@ -844,7 +844,9 @@ async function renderEntry(){
       </div>
       <div class="note" id="entryHint" style="margin:8px 0 0"></div>
     </div>
+    <div id="statusBanner"></div>
     <div id="entryBody"></div>
+    <div id="submitCard"></div>
   `;
   const kSel = el.querySelector('#entryKitchen');
   if (kSel) kSel.addEventListener('change', e=>{ currentKitchenId = e.target.value; renderEntry(); });
@@ -858,6 +860,24 @@ async function renderEntry(){
   const day = await ensureDayInitialized(currentKitchenId, currentDate);
   el.querySelector('#entryHint').textContent = `Editing ${ddmmyyyy(currentDate)} — green italic values carry forward from the day before.`;
 
+  const isSubmitted = day.status === 'submitted';
+  const bannerEl = document.getElementById('statusBanner');
+  if (isSubmitted){
+    bannerEl.innerHTML = `<div class="card" style="background:#f0fdf4;border:2px solid #166534;">
+      <div class="row" style="justify-content:space-between">
+        <div><b style="color:#166534;">✓ SUBMITTED</b> — ${day.submittedBy?escapeAttr(day.submittedBy)+' · ':''}${day.submittedAt?new Date(day.submittedAt).toLocaleString('en-IN'):''}. This day is locked to protect what's already been reported.</div>
+        <button class="sm" id="reopenBtn">🔓 Reopen for editing</button>
+      </div></div>`;
+    bannerEl.querySelector('#reopenBtn').addEventListener('click', async ()=>{
+      if (!confirm('Reopen this day for editing? Anyone with access can then change it until it is submitted again.')) return;
+      day.status = 'draft'; delete day.submittedBy; delete day.submittedAt;
+      await saveDay(currentKitchenId, currentDate);
+      renderEntry();
+    });
+  } else {
+    bannerEl.innerHTML = '';
+  }
+
   const body = document.getElementById('entryBody');
   body.innerHTML = '';
   body.appendChild(buildCampusesCard(day));
@@ -867,7 +887,61 @@ async function renderEntry(){
   todaysDishes.forEach(m => body.appendChild(buildDishIngredientCard(day, m)));
   body.appendChild(buildProvisionsCard(day));
   body.appendChild(buildDistributionCard(day));
+
+  if (isSubmitted){
+    // lock every input once submitted — editing must go through the explicit Reopen action
+    body.querySelectorAll('input, select, button').forEach(elx => elx.disabled = true);
+  } else {
+    document.getElementById('submitCard').appendChild(buildSubmitCard(day, todaysDishes));
+  }
 }
+
+function buildSubmitCard(day, todaysDishes){
+  const card = document.createElement('div');
+  card.className = 'card';
+  card.style.cssText = 'border:2px solid #1d4ed8;';
+
+  const myBranches = branches.filter(b => b.kitchenId === currentKitchenId);
+  const totalStrength = myBranches.reduce((s,b)=>{ const c=day.campuses[b.id]||{}; return s+(+c.students||0)+(+c.staff||0)+(+c.subStaff||0)+(+c.others||0); },0);
+  let totalCost = 0;
+  todaysDishes.forEach(m=>{
+    provisions.forEach(pm=>{ const p=day.provisions[pm.id]; const q=(p.dish||{})[m.id]; if(q) totalCost += (+q)*(+p.rate||0); });
+  });
+  let totalWastage = 0;
+  myBranches.forEach(b=>{ const c=day.campuses[b.id]||{}; SESSIONS.forEach(s=>{ totalWastage += (+(c.wastage[s]?.waste)||0); }); });
+  const anyNegative = provisions.some(pm=>{ const p=day.provisions[pm.id]; return p && computeTotals(p).closing < 0; });
+
+  const warnings = [];
+  if (totalStrength === 0) warnings.push("No branch has any strength entered yet — Campuses Details looks empty.");
+  if (!todaysDishes.length) warnings.push("No dishes added to Today's Menu yet.");
+  if (todaysDishes.length && totalCost === 0) warnings.push("Dishes are added but no ingredient quantities have been entered yet.");
+  if (anyNegative) warnings.push("Some provisions show a negative closing balance — check Provisions summary before submitting.");
+
+  card.innerHTML = `<h2>Review &amp; submit</h2>
+    <div class="grid4" style="margin-bottom:10px;">
+      <div class="metric"><div class="lbl">Total strength</div><div class="val">${totalStrength}</div></div>
+      <div class="metric"><div class="lbl">Total cost</div><div class="val">${fmtMoney(totalCost)}</div></div>
+      <div class="metric"><div class="lbl">₹ / head (kitchen)</div><div class="val">${fmt(totalStrength>0?totalCost/totalStrength:0,2)}</div></div>
+      <div class="metric"><div class="lbl">Wastage</div><div class="val">${fmt(totalWastage,1)} kg</div></div>
+    </div>
+    ${warnings.length ? `<div class="note" style="color:#b91c1c;font-weight:600;">${warnings.map(w=>'⚠ '+w).join('<br>')}</div>` : `<div class="note" style="color:#166534;font-weight:600;">✓ Looks complete — strength, menu, and consumption are all filled in.</div>`}
+    <button class="primary" id="submitDayBtn" style="margin-top:10px;">✓ Submit this day</button>
+    <div class="note">Submitting locks today's entry so it can't be accidentally changed later. You (or an admin) can always reopen it if something needs correcting.</div>`;
+
+  card.querySelector('#submitDayBtn').addEventListener('click', async ()=>{
+    if (warnings.length && !confirm('There are warnings above — submit anyway?')) return;
+    if (!confirm(`Submit ${ddmmyyyy(currentDate)} for ${(kitchens.find(k=>k.id===currentKitchenId)||{}).name}? It will be locked for editing.`)) return;
+    day.status = 'submitted';
+    day.submittedBy = currentUser.email;
+    day.submittedAt = new Date().toISOString();
+    await saveDay(currentKitchenId, currentDate);
+    toast('Submitted');
+    renderEntry();
+  });
+  return card;
+}
+
+
 
 // "Today's Menu" — pick which dishes are being made today, per session. This is the one
 // thing that genuinely changes every day, so it's a deliberate pick, not an assumption.
@@ -1317,6 +1391,25 @@ async function renderDashboard(){
   const body = document.getElementById('dashBody');
   body.innerHTML = '';
 
+  // --- Strength Coverage ---
+  const totalStudents = myBranches.reduce((s,b)=>s+(+((day.campuses[b.id]||{}).students)||0),0);
+  const totalStaff = myBranches.reduce((s,b)=>s+(+((day.campuses[b.id]||{}).staff)||0),0);
+  const totalSubStaff = myBranches.reduce((s,b)=>s+(+((day.campuses[b.id]||{}).subStaff)||0),0);
+  const totalOthers = myBranches.reduce((s,b)=>s+(+((day.campuses[b.id]||{}).others)||0),0);
+  const grandTotalStrength = totalStudents+totalStaff+totalSubStaff+totalOthers;
+  const branchesReporting = myBranches.filter(b=>{ const c=day.campuses[b.id]||{}; return (+c.students||0)+(+c.staff||0)+(+c.subStaff||0)+(+c.others||0) > 0; }).length;
+  const scCard = document.createElement('div'); scCard.className='card';
+  scCard.innerHTML = `<h2>Strength coverage — ${ddmmyyyy(currentDate)}</h2>
+    <div class="grid4">
+      <div class="metric"><div class="lbl">Students</div><div class="val">${totalStudents}</div></div>
+      <div class="metric"><div class="lbl">Staff</div><div class="val">${totalStaff}</div></div>
+      <div class="metric"><div class="lbl">Sub staff</div><div class="val">${totalSubStaff}</div></div>
+      <div class="metric"><div class="lbl">Others</div><div class="val">${totalOthers}</div></div>
+      <div class="metric" style="background:#eef2ff;"><div class="lbl">Total strength</div><div class="val">${grandTotalStrength}</div></div>
+      <div class="metric"><div class="lbl">Branches reporting</div><div class="val">${branchesReporting} / ${myBranches.length}</div></div>
+    </div>`;
+  body.appendChild(scCard);
+
   // --- Session & Category targets (matches your existing Target Per Head sheet) ---
   const sessionTarget = (await dbGet('sessionTargets', currentKitchenId)) || {};
   const kitchenTotalStrengthForTargets = myBranches.reduce((s,b)=>s+branchStrength[b.id],0);
@@ -1355,6 +1448,82 @@ async function renderDashboard(){
       }).join('')}
     </tbody></table></div>`;
   body.appendChild(stCard);
+
+  // --- Budget Alerts (with item-level drill-down, like your original dashboard) ---
+  const ALERT_THRESHOLD_PCT = 10;
+  const alerts = [];
+  SESSIONS.forEach(s=>{
+    const tgt = sessionTarget[s.toLowerCase()]||0;
+    const actual = sessionActual[s];
+    if (tgt>0 && actual>tgt){ alerts.push({label: s[0]+s.slice(1).toLowerCase(), pctOver: (actual-tgt)/tgt*100, actual, tgt, isSession:true, sessionKey:s}); }
+  });
+  categoryDefs.forEach(([label,key])=>{
+    const tgt = sessionTarget[key]||0; const actual = categoryActual[key];
+    if (tgt>0 && actual>tgt){ alerts.push({label, pctOver:(actual-tgt)/tgt*100, actual, tgt, isSession:false}); }
+  });
+  alerts.sort((a,b)=>b.pctOver-a.pctOver);
+  const abCard = document.createElement('div'); abCard.className='card';
+  if (!alerts.length){
+    abCard.style.cssText='border-top:3px solid #059669;';
+    abCard.innerHTML = `<h2>Budget alerts</h2><p class="note" style="color:#166534;font-weight:600;">✓ Nothing is over target today.</p>`;
+  } else {
+    abCard.style.cssText='border-top:3px solid #e11d48;';
+    const rowsHtml = alerts.map(a=>{
+      let driver = '';
+      if (a.isSession){
+        // find the single provision item contributing the most cost to this session's dishes
+        const costByItem = {};
+        todaysDishes.filter(m=>m.session===a.sessionKey).forEach(m=>{
+          provisions.forEach(pm=>{ const p=day.provisions[pm.id]; const q=(p.dish||{})[m.id]; if(q) costByItem[pm.id]=(costByItem[pm.id]||0)+(+q)*(+p.rate||0); });
+        });
+        const topId = Object.keys(costByItem).sort((x,y)=>costByItem[y]-costByItem[x])[0];
+        if (topId){
+          const pm = provisions.find(p=>p.id===topId);
+          const perHead = kitchenTotalStrengthForTargets>0 ? costByItem[topId]/kitchenTotalStrengthForTargets : 0;
+          driver = `🔍 <b>${escapeAttr(pm.name)}</b> · ${fmt(perHead,2)}/head`;
+        }
+      }
+      return `<div style="padding:8px 0;border-bottom:1px solid #fecaca;">
+        <div class="row" style="justify-content:space-between"><b>${a.label}</b><span class="badge over">+${fmt(a.pctOver,0)}%</span></div>
+        <div class="note" style="margin:2px 0 0;">${fmt(a.actual,2)} vs target ${fmt(a.tgt,2)}${driver?' · '+driver:''}</div>
+      </div>`;
+    }).join('');
+    abCard.innerHTML = `<h2>Budget alerts (${alerts.length})</h2>${rowsHtml}`;
+  }
+  body.appendChild(abCard);
+
+  // --- Particulars — category × session breakdown (qty, qty/head, amount, amount/head) ---
+  const PARTICULARS_CATEGORIES = ['RICE','MILK','CURD','OILS','EGGS','CHICKEN / NON-VEG','BAKERY','PILLETS / FIREWOOD','GAS / DIESEL','ROTI','FRUITS','VEGETABLES','PROVISIONS'];
+  const partData = {}; // category -> session -> {qty, amt}
+  PARTICULARS_CATEGORIES.forEach(cat=>{
+    partData[cat] = {};
+    SESSIONS.forEach(s=>{
+      let qty=0, amt=0;
+      provisions.filter(pm=>pm.category===cat).forEach(pm=>{
+        const p = day.provisions[pm.id];
+        if (!p) return;
+        todaysDishes.filter(m=>m.session===s).forEach(m=>{
+          const q = (p.dish||{})[m.id];
+          if (q){ qty += (+q); amt += (+q)*(+p.rate||0); }
+        });
+      });
+      partData[cat][s] = {qty, amt};
+    });
+  });
+  const partCard = document.createElement('div'); partCard.className='card';
+  partCard.innerHTML = `<h2>Particulars — consumption &amp; amount by session</h2>
+    <div class="tbl-wrap"><table>
+      <thead><tr><th class="txt" rowspan="2">Category</th>${SESSIONS.map(s=>`<th colspan="2">${s[0]+s.slice(1).toLowerCase()}</th>`).join('')}<th colspan="2">Total</th></tr>
+      <tr>${SESSIONS.map(()=>`<th>Qty</th><th>₹</th>`).join('')}<th>Qty</th><th>₹</th></tr></thead>
+      <tbody>
+        ${PARTICULARS_CATEGORIES.map(cat=>{
+          let totQty=0, totAmt=0;
+          const cells = SESSIONS.map(s=>{ const d=partData[cat][s]; totQty+=d.qty; totAmt+=d.amt; return `<td>${d.qty?fmt(d.qty,1):'—'}</td><td>${d.amt?fmtMoney(d.amt):'—'}</td>`; }).join('');
+          return `<tr><td class="txt">${cat}</td>${cells}<td><b>${totQty?fmt(totQty,1):'—'}</b></td><td><b>${totAmt?fmtMoney(totAmt):'—'}</b></td></tr>`;
+        }).join('')}
+      </tbody>
+    </table></div>`;
+  body.appendChild(partCard);
 
   // --- AC / Semi-AC / Non-AC vs Target ---
   const catCard = document.createElement('div'); catCard.className='card';
