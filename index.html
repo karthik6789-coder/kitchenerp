@@ -195,6 +195,55 @@ function humanizeAuthError(e){
   if (c.includes('too-many-requests')) return 'Too many attempts. Try again in a bit.';
   return 'Could not log in. ' + (e && e.message || '');
 }
+// Admin creates another person's login from right here — no trip to Firebase Console needed.
+// Uses a SECOND, separate Firebase app instance to create the account, so the new sign-in
+// doesn't hijack the admin's own session (this is the standard workaround for "admin creates
+// other users" purely client-side, since createUserWithEmailAndPassword normally signs YOU
+// into the new account on whatever instance you call it from).
+async function createUserAccount(){
+  const email = document.getElementById('newUserEmail').value.trim();
+  const password = document.getElementById('newUserPassword').value;
+  const role = document.getElementById('newUserRole').value;
+  const kitchenId = document.getElementById('newUserKitchen').value;
+  const status = document.getElementById('createUserStatus');
+  status.textContent = '';
+  if (!email || !password){ status.textContent = 'Enter an email and a temporary password.'; return; }
+  if (password.length < 6){ status.textContent = 'Password needs to be at least 6 characters (Firebase requirement).'; return; }
+
+  if (USE_LOCAL_MOCK){
+    const id = newId();
+    const userData = { email, role, kitchenIds: role==='dataentry' ? [kitchenId] : [], name: email.split('@')[0] };
+    await dbSet('users', id, userData);
+    status.innerHTML = `✓ Created (local mock) — ${email} as ${role}.`;
+    document.getElementById('newUserEmail').value=''; document.getElementById('newUserPassword').value='';
+    setTimeout(renderMaster, 2500);
+    return;
+  }
+
+  status.textContent = 'Creating…';
+  let secondaryApp;
+  try{
+    secondaryApp = firebase.initializeApp(FIREBASE_CONFIG, 'UserCreation_' + Date.now());
+    const secondaryAuth = secondaryApp.auth();
+    const cred = await secondaryAuth.createUserWithEmailAndPassword(email, password);
+    const uid = cred.user.uid;
+    await secondaryAuth.signOut();
+    const userData = { email, role, kitchenIds: role==='dataentry' ? [kitchenId] : [], name: email.split('@')[0] };
+    await dbSet('users', uid, userData);
+    status.innerHTML = `✓ Created — tell them to sign in with <b>${escapeAttr(email)}</b> and the temporary password you set. They should change it after their first login (there's no in-app "change password" yet — for now, create a new login with a fresh password and remove the old one if it needs resetting).`;
+    document.getElementById('newUserEmail').value=''; document.getElementById('newUserPassword').value='';
+    setTimeout(renderMaster, 3500);
+  } catch(e){
+    const c = e && e.code || '';
+    if (c.includes('email-already-in-use')) status.textContent = 'That email already has a login — find them in the table below and edit their role there instead.';
+    else if (c.includes('weak-password')) status.textContent = 'Password too weak — use at least 6 characters.';
+    else if (c.includes('invalid-email')) status.textContent = 'That email address looks invalid.';
+    else status.textContent = 'Could not create the login: ' + (e && e.message || e);
+  } finally {
+    if (secondaryApp) await secondaryApp.delete().catch(()=>{});
+  }
+}
+
 function doLogout(){
   if (!USE_LOCAL_MOCK && auth) auth.signOut();
   currentUser = null; currentRole = null;
@@ -216,10 +265,35 @@ function ddmmyyyy(iso){ const [y,m,d]=iso.split('-'); return `${d}-${m}-${y}`; }
 function escapeAttr(s){ return String(s==null?'':s).replace(/"/g,'&quot;'); }
 
 async function initFirebase(){
-  if (USE_LOCAL_MOCK){ console.warn('Running in LOCAL MOCK mode — paste your Firebase config to go live.'); return; }
+  if (USE_LOCAL_MOCK){
+    console.warn('Running in LOCAL MOCK mode — paste your Firebase config to go live.');
+    document.getElementById('loginScreen').style.display = 'block';
+    return;
+  }
   const app = firebase.initializeApp(FIREBASE_CONFIG);
   auth = firebase.auth();
   dbFS = firebase.firestore();
+  // keep the session alive across page refreshes/tab closes — this is what was missing:
+  // Firebase silently restores the underlying token on load, but without this listener
+  // the app never learns about it and always fell back to showing the login screen.
+  await auth.setPersistence(firebase.auth.Auth.Persistence.LOCAL);
+  auth.onAuthStateChanged(async (user)=>{
+    if (user){
+      currentUser = { uid: user.uid, email: user.email };
+      const roleDoc = await dbGet('users', user.uid);
+      if (!roleDoc){
+        document.getElementById('loginError').textContent = 'Your account has no role assigned yet. Ask your admin to add you under Users & roles.';
+        document.getElementById('loginScreen').style.display = 'block';
+        document.getElementById('mainApp').style.display = 'none';
+        return;
+      }
+      currentRole = roleDoc;
+      await enterApp();
+    } else {
+      document.getElementById('loginScreen').style.display = 'block';
+      document.getElementById('mainApp').style.display = 'none';
+    }
+  });
 }
 
 document.getElementById('loginBtn').addEventListener('click', async ()=>{
@@ -230,7 +304,11 @@ document.getElementById('loginBtn').addEventListener('click', async ()=>{
   if (!email || !pw){ errEl.textContent = 'Enter email and password.'; return; }
   const res = await doLogin(email, pw);
   if (!res.ok){ errEl.textContent = res.error; return; }
-  await enterApp();
+  // For real Firebase, onAuthStateChanged (wired in initFirebase) fires right after a
+  // successful sign-in and takes it from here — same single code path used to restore a
+  // session on refresh, so login and refresh-restore can never drift apart. The local mock
+  // has no such listener, so it still needs this explicit call.
+  if (USE_LOCAL_MOCK) await enterApp();
 });
 document.getElementById('logoutLink').addEventListener('click', (e)=>{ e.preventDefault(); doLogout(); });
 
@@ -295,25 +373,40 @@ async function importMasterDataFromExcel(){
   const kitchenCodeToId = {}; kitchens.forEach(k=>{ if (k.kitchenCode) kitchenCodeToId[k.kitchenCode]=k.id; });
   const provisionCodeToId = {}; provisions.forEach(p=>{ if (p.provisionId) provisionCodeToId[p.provisionId]=p.id; });
 
-  // 1) Kitchens — must go first, everything else references KITCHEN_ID
+  // 1) Kitchens — must go first, everything else references KITCHEN_ID. A KITCHEN_ID can
+  // legitimately repeat if the kitchen is served by more than one bakery (confirmed in your
+  // file: KVJA106208 has both "VJA BAKERY 1" and "VJA BAKERY 3" on separate rows) — so bakery
+  // names are ACCUMULATED into a list per kitchen, never overwritten.
   const kRows = sheetRows('Kitchen_List');
+  let multiBakeryKitchens = [];
   if (kRows){
     status.textContent = `Importing ${kRows.length} kitchens…`;
     for (const row of kRows){
       const code = cleanImportedText(row['KITCHEN_ID']);
       if (!code) continue;
+      const bakery = cleanImportedText(row['BAKERY_NAME']);
       let id = kitchenCodeToId[code];
-      const data = {
-        stateCode: cleanImportedText(row['STATE']),
-        division: cleanImportedText(row['DIVISION']),
-        kitchenCode: code,
-        name: cleanImportedText(row['KITCHEN_NAME']),
-        bulkStoreName: cleanImportedText(row['BULK_STORE_NAME']),
-        bakeryName: cleanImportedText(row['BAKERY_NAME']),
-      };
-      if (!id){ id = newId(); kitchens.push(Object.assign({id}, data)); kitchenCodeToId[code] = id; }
-      else { Object.assign(kitchens.find(k=>k.id===id), data); }
-      await dbSet('kitchens', id, data);
+      if (!id){
+        id = newId();
+        const data = {
+          stateCode: cleanImportedText(row['STATE']),
+          division: cleanImportedText(row['DIVISION']),
+          kitchenCode: code,
+          name: cleanImportedText(row['KITCHEN_NAME']),
+          bulkStoreName: cleanImportedText(row['BULK_STORE_NAME']),
+          bakeryNames: bakery ? [bakery] : [],
+        };
+        kitchens.push(Object.assign({id}, data));
+        kitchenCodeToId[code] = id;
+        await dbSet('kitchens', id, data);
+      } else {
+        const existing = kitchens.find(k=>k.id===id);
+        if (bakery && !existing.bakeryNames.includes(bakery)){
+          existing.bakeryNames.push(bakery);
+          multiBakeryKitchens.push(existing.name);
+          await dbSet('kitchens', id, existing);
+        }
+      }
       counts.kitchens++;
     }
   }
@@ -423,7 +516,10 @@ async function importMasterDataFromExcel(){
     }
   }
 
-  status.innerHTML = `✓ Done — ${counts.kitchens} kitchens, ${counts.provisions} provisions, ${counts.branches} branches, ${counts.openingBalances} opening balances, ${counts.targets} target rows.`;
+  const uniqueKitchenNote = multiBakeryKitchens.length
+    ? `<br>ℹ️ ${multiBakeryKitchens.length} kitchen row(s) shared a Kitchen ID with an earlier row and were correctly recognized as extra bakeries for the SAME kitchen, not duplicates: ${multiBakeryKitchens.join(', ')}.`
+    : '';
+  status.innerHTML = `✓ Done — ${counts.kitchens} kitchen rows processed (${kitchens.length} unique kitchens), ${counts.provisions} provisions, ${counts.branches} branches, ${counts.openingBalances} opening balances, ${counts.targets} target rows.${uniqueKitchenNote}`;
   toast('Master data imported');
   setTimeout(renderMaster, 2500); // let the confirmation message stay visible briefly before the full refresh replaces it
 }
@@ -524,12 +620,21 @@ async function renderMaster(){
     </div>
     <div class="card">
       <div class="toolbar"><h2>Users &amp; roles</h2></div>
-      <div class="note">Add each person's Google sign-in email here (in Firebase Console → Authentication first, then here) with their role. Data-entry users also need Kitchen IDs listed (comma-separated) so they only see their own kitchen.</div>
+      <div class="note">Create a login and assign its role in one step — no need to visit Firebase Console at all. Data-entry logins also need a Kitchen (they'll only ever see that one kitchen).</div>
+      <div class="row" style="margin-bottom:10px;flex-wrap:wrap;">
+        <input type="email" id="newUserEmail" placeholder="Email" style="width:200px;">
+        <input type="text" id="newUserPassword" placeholder="Temporary password (tell them this)" style="width:220px;">
+        <select id="newUserRole"><option value="admin">admin</option><option value="dataentry" selected>dataentry</option><option value="director">director</option></select>
+        <select id="newUserKitchen" style="width:200px;">${kitchens.map(k=>`<option value="${k.id}">${escapeAttr(k.name)}</option>`).join('')}</select>
+        <button class="sm primary" id="createUserBtn">+ Create login</button>
+      </div>
+      <div id="createUserStatus" class="note"></div>
       <div class="tbl-wrap"><table id="userTable"><thead><tr><th class="txt">Email</th><th class="txt">Role</th><th class="txt">Kitchen IDs</th><th></th></tr></thead><tbody></tbody></table></div>
     </div>
   `;
 
   el.querySelector('#masterImportBtn').addEventListener('click', importMasterDataFromExcel);
+  el.querySelector('#createUserBtn').addEventListener('click', createUserAccount);
 
   const kBody = el.querySelector('#kitchenTable tbody');
   kitchens.forEach(k=>{
@@ -539,13 +644,16 @@ async function renderMaster(){
       <td class="txt"><input class="cell" style="width:100px;text-align:left" value="${escapeAttr(k.kitchenCode||'')}" data-f="kitchenCode"></td>
       <td class="txt"><input class="cell" style="width:180px;text-align:left" value="${escapeAttr(k.name)}" data-f="name"></td>
       <td class="txt"><input class="cell" style="width:140px;text-align:left" value="${escapeAttr(k.bulkStoreName||'')}" data-f="bulkStoreName"></td>
-      <td class="txt"><input class="cell" style="width:120px;text-align:left" value="${escapeAttr(k.bakeryName||'')}" data-f="bakeryName"></td>
+      <td class="txt"><input class="cell" style="width:150px;text-align:left" value="${escapeAttr((k.bakeryNames||[]).join(', '))}" data-f="bakeryNames" title="Comma-separated if more than one"></td>
       <td><button class="sm danger" data-del>Remove</button></td>`;
-    tr.querySelectorAll('[data-f]').forEach(inp=>inp.addEventListener('change', async ()=>{ k[inp.dataset.f]=inp.value; await dbSet('kitchens', k.id, k); toast('Saved'); }));
+    tr.querySelectorAll('[data-f]').forEach(inp=>inp.addEventListener('change', async ()=>{
+      k[inp.dataset.f] = inp.dataset.f==='bakeryNames' ? inp.value.split(',').map(s=>s.trim()).filter(Boolean) : inp.value;
+      await dbSet('kitchens', k.id, k); toast('Saved');
+    }));
     tr.querySelector('[data-del]').addEventListener('click', async ()=>{ if(!confirm('Remove '+k.name+'?'))return; await dbDelete('kitchens', k.id); kitchens = kitchens.filter(x=>x.id!==k.id); renderMaster(); });
     kBody.appendChild(tr);
   });
-  el.querySelector('#addKitchenBtn').addEventListener('click', async ()=>{ const id=newId(); const k={name:'NEW KITCHEN',stateCode:'',division:'',kitchenCode:'',bulkStoreName:'',bakeryName:''}; await dbSet('kitchens',id,k); kitchens.push(Object.assign({id},k)); renderMaster(); });
+  el.querySelector('#addKitchenBtn').addEventListener('click', async ()=>{ const id=newId(); const k={name:'NEW KITCHEN',stateCode:'',division:'',kitchenCode:'',bulkStoreName:'',bakeryNames:[]}; await dbSet('kitchens',id,k); kitchens.push(Object.assign({id},k)); renderMaster(); });
 
   const bBody = el.querySelector('#branchTable tbody');
   branches.forEach(b=>{
@@ -1146,6 +1254,44 @@ async function renderDashboard(){
   el.querySelector('#dashDate').addEventListener('change', e=>{ currentDate = e.target.value; renderDashboard(); });
   el.querySelector('#repFrom').addEventListener('change', renderDashboard);
   el.querySelector('#repTo').addEventListener('change', renderDashboard);
+
+  // Bird's-eye view across every kitchen you have access to — genuinely useful once you're
+  // overseeing dozens of kitchens, not just one. Deliberately lightweight: reads each
+  // kitchen's already-saved day doc directly rather than running the full cascade-init
+  // logic 45 times over, so this stays fast even at real scale.
+  if (myKitchens.length > 1){
+    const overviewCard = document.createElement('div'); overviewCard.className='card';
+    overviewCard.innerHTML = `<h2>All kitchens — ${ddmmyyyy(currentDate)}</h2><div class="note">Click a row to open that kitchen below.</div><div class="tbl-wrap" id="overviewTblWrap"><div class="note">Loading…</div></div>`;
+    el.insertBefore(overviewCard, document.getElementById('dashBody'));
+    (async ()=>{
+      const rows = [];
+      for (const k of myKitchens){
+        const dayDoc = await dbGet('dailyEntries', dayDocId(k.id, currentDate));
+        const kBranches = branches.filter(b=>b.kitchenId===k.id);
+        if (!dayDoc){ rows.push({k, strength:0, cost:0, hasData:false}); continue; }
+        const kStrength = {}; kBranches.forEach(b=>{ const c=dayDoc.campuses[b.id]||{}; kStrength[b.id]=(+c.students||0)+(+c.staff||0)+(+c.subStaff||0)+(+c.others||0); });
+        let totalCost = 0;
+        (dayDoc.selectedDishIds||[]).forEach(mid=>{
+          const flags = dayDoc.distribution[mid]||{};
+          let dishCost = 0;
+          Object.entries(dayDoc.provisions||{}).forEach(([pid,p])=>{ const q=(p.dish||{})[mid]; if(q) dishCost += (+q)*(+p.rate||0); });
+          totalCost += dishCost; // approximate: counted once per dish, allocated below by recipient strength
+        });
+        const totalStrength = kBranches.reduce((s,b)=>s+kStrength[b.id],0);
+        rows.push({k, strength: totalStrength, cost: totalCost, hasData: true});
+      }
+      const wrap = document.getElementById('overviewTblWrap');
+      if (!wrap) return; // user navigated away before this finished
+      wrap.innerHTML = `<table><thead><tr><th class="txt">Kitchen</th><th class="txt">Division</th><th>Strength</th><th>Total cost</th><th>₹/head</th><th></th></tr></thead>
+        <tbody>${rows.map(r=>`<tr style="cursor:pointer" data-kid="${r.k.id}">
+          <td class="txt">${escapeAttr(r.k.name)}</td><td class="txt">${escapeAttr(r.k.division||'')}</td>
+          <td>${r.hasData?r.strength:'—'}</td><td>${r.hasData?fmtMoney(r.cost):'—'}</td>
+          <td><b>${r.hasData && r.strength>0 ? fmt(r.cost/r.strength,2) : '—'}</b></td>
+          <td>${r.k.id===currentKitchenId?'<span class="badge ok">viewing</span>':''}</td>
+        </tr>`).join('')}</tbody></table>`;
+      wrap.querySelectorAll('[data-kid]').forEach(tr=>tr.addEventListener('click', ()=>{ currentKitchenId = tr.dataset.kid; renderDashboard(); }));
+    })();
+  }
 
   if (!currentKitchenId){ document.getElementById('dashBody').innerHTML = '<div class="card">No kitchen assigned.</div>'; return; }
 
